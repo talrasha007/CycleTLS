@@ -3,8 +3,8 @@ package unit
 import (
 	"testing"
 
-	"github.com/Danny-Dasilva/CycleTLS/cycletls"
 	utls "github.com/refraction-networking/utls"
+	"github.com/talrasha007/CycleTLS/cycletls"
 )
 
 const (
