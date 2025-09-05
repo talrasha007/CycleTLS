@@ -133,13 +133,13 @@ func unBrotliData(data []byte) (resData []byte, err error) {
 }
 
 // StringToSpec creates a ClientHelloSpec based on a JA3 string
-func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool) (*utls.ClientHelloSpec, error) {
+func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string) (*utls.ClientHelloSpec, error) {
 	parsedUserAgent := parseUserAgent(userAgent)
 	// if tlsExtensions == nil {
 	// 	tlsExtensions = &TLSExtensions{}
 	// }
 	// ext := tlsExtensions
-	extMap := genMap(false)
+	extMap := genMap(false, signatureAlgorithms)
 	tokens := strings.Split(ja3, ",")
 
 	version := tokens[0]
@@ -180,17 +180,17 @@ func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool) (*utls.ClientHe
 		if err != nil {
 			return nil, err
 		}
-		
+
 		// For TLS 1.3 (version 772), validate curve compatibility
 		ver, _ := strconv.ParseUint(version, 10, 16)
 		if uint16(ver) == utls.VersionTLS13 && !isTLS13CompatibleCurve(uint16(cid)) {
 			// Skip incompatible curves for TLS 1.3
 			continue
 		}
-		
+
 		targetCurves = append(targetCurves, utls.CurveID(cid))
 	}
-	
+
 	// Ensure TLS 1.3 has at least basic compatible curves if all were filtered out
 	ver, _ := strconv.ParseUint(version, 10, 16)
 	if uint16(ver) == utls.VersionTLS13 && len(targetCurves) == 0 {
@@ -201,7 +201,7 @@ func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool) (*utls.ClientHe
 		targetCurves = append(targetCurves, utls.CurveID(29)) // X25519
 		targetCurves = append(targetCurves, utls.CurveID(23)) // secp256r1
 	}
-	
+
 	extMap["10"] = &utls.SupportedCurvesExtension{Curves: targetCurves}
 
 	// parse point formats
@@ -275,10 +275,10 @@ func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool) (*utls.ClientHe
 }
 
 // StringToTLS13CompatibleSpec creates a TLS 1.3 compatible ClientHelloSpec by filtering curves
-func StringToTLS13CompatibleSpec(ja3 string, userAgent string, forceHTTP1 bool) (*utls.ClientHelloSpec, error) {
+func StringToTLS13CompatibleSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string) (*utls.ClientHelloSpec, error) {
 	// For TLS 1.3 compatibility, we use only widely supported curves: X25519 (29) and secp256r1 (23)
 	tls13CompatibleJA3 := convertJA3ForTLS13(ja3)
-	return StringToSpec(tls13CompatibleJA3, userAgent, forceHTTP1)
+	return StringToSpec(tls13CompatibleJA3, userAgent, forceHTTP1, signatureAlgorithms)
 }
 
 // convertJA3ForTLS13 converts a JA3 string to use TLS 1.3 compatible curves
@@ -287,15 +287,15 @@ func convertJA3ForTLS13(ja3 string) string {
 	if len(tokens) != 5 {
 		return ja3 // Return original if malformed
 	}
-	
+
 	// Replace TLS version (position 0) with TLS 1.3 (772) if it's TLS 1.2 (771)
 	if tokens[0] == "771" {
 		tokens[0] = "772" // Upgrade TLS 1.2 to TLS 1.3
 	}
-	
+
 	// Replace curves (position 3) with TLS 1.3 compatible ones: X25519 (29) and secp256r1 (23)
 	tokens[3] = "29-23" // X25519 and secp256r1
-	
+
 	return strings.Join(tokens, ",")
 }
 
@@ -305,7 +305,7 @@ func isTLS13CompatibleCurve(curveID uint16) bool {
 	switch curveID {
 	case 23: // secp256r1 (P-256)
 		return true
-	case 24: // secp384r1 (P-384) 
+	case 24: // secp384r1 (P-384)
 		return true
 	case 25: // secp521r1 (P-521)
 		return true
@@ -313,7 +313,7 @@ func isTLS13CompatibleCurve(curveID uint16) bool {
 		return true
 	case 30: // X448
 		return true
-		
+
 	// Post-quantum hybrid curves (emerging standard)
 	case 4587: // 0x11EB - SecP256r1MLKEM768 (P-256 + MLKEM768)
 		return true
@@ -321,7 +321,7 @@ func isTLS13CompatibleCurve(curveID uint16) bool {
 		return true
 	case 4589: // 0x11ED - SecP384r1MLKEM1024 (P-384 + MLKEM1024)
 		return true
-		
+
 	default:
 		return false
 	}
@@ -470,15 +470,15 @@ func ParseJA4String(ja4 string) (*JA4Components, error) {
 
 // JA4RComponents represents the parsed components of a JA4_r (raw) string
 type JA4RComponents struct {
-	TLSVersion         string
-	SNI                string   // "d" for domain, "i" for IP
-	CipherCount        int      // Number of cipher suites
-	ExtensionCount     int      // Number of extensions
-	ExtensionCountStr  string   // Original extension count format (e.g., "09")
-	ALPN               string   // ALPN value (e.g., "h2" for HTTP/2)
-	CipherSuites       []uint16 // Raw cipher suite values
-	Extensions         []uint16 // Raw extension values
-	SignatureSchemes   []uint16 // Raw signature scheme values (optional, from 4th part)
+	TLSVersion        string
+	SNI               string   // "d" for domain, "i" for IP
+	CipherCount       int      // Number of cipher suites
+	ExtensionCount    int      // Number of extensions
+	ExtensionCountStr string   // Original extension count format (e.g., "09")
+	ALPN              string   // ALPN value (e.g., "h2" for HTTP/2)
+	CipherSuites      []uint16 // Raw cipher suite values
+	Extensions        []uint16 // Raw extension values
+	SignatureSchemes  []uint16 // Raw signature scheme values (optional, from 4th part)
 }
 
 // ParseJA4RString parses a JA4_r (raw) string into its components
@@ -738,15 +738,15 @@ func JA4RStringToSpec(ja4r string, userAgent string, forceHTTP1 bool, disableGre
 
 	// Calculate how many extensions we'll actually have after processing
 	actualExtensionCount := len(components.Extensions)
-	
+
 	// Check if ALPN will be added automatically
 	if components.ALPN != "" && !hasALPNExtension {
 		actualExtensionCount++
 	}
-	
+
 	// Add SNI extension only if:
 	// 1. SNI indicator is "d" (domain)
-	// 2. SNI (0x0000) is not already in the extensions list  
+	// 2. SNI (0x0000) is not already in the extensions list
 	// 3. The claimed extension count is higher than our actual count
 	extensionDeficit := components.ExtensionCount - actualExtensionCount
 	shouldAddSNI := components.SNI == "d" && !hasSNIExtension && extensionDeficit > 0
@@ -881,13 +881,13 @@ func createTlsVersion(ver uint16, disableGrease bool) (tlsMaxVersion uint16, tls
 			Versions: versions,
 		}
 	case utls.VersionTLS12:
-		tlsMaxVersion = utls.VersionTLS12
-		tlsMinVersion = utls.VersionTLS11
+		tlsMaxVersion = utls.VersionTLS13
+		tlsMinVersion = utls.VersionTLS12
 		versions := []uint16{}
 		if !disableGrease {
 			versions = append(versions, utls.GREASE_PLACEHOLDER)
 		}
-		versions = append(versions, utls.VersionTLS12, utls.VersionTLS11)
+		versions = append(versions, utls.VersionTLS13, utls.VersionTLS12)
 		tlsSuppor = &utls.SupportedVersionsExtension{
 			Versions: versions,
 		}
@@ -908,14 +908,9 @@ func createTlsVersion(ver uint16, disableGrease bool) (tlsMaxVersion uint16, tls
 	return
 }
 
-func genMap(disableGrease bool) (extMap map[string]utls.TLSExtension) {
-	extMap = map[string]utls.TLSExtension{
-		"0": &utls.SNIExtension{},
-		"5": &utls.StatusRequestExtension{},
-		// These are applied later
-		// "10": &tls.SupportedCurvesExtension{...}
-		// "11": &tls.SupportedPointsExtension{...}
-		"13": &utls.SignatureAlgorithmsExtension{
+func getSignatureAlgorithmsExtension(signatureAlgorithms string) *utls.SignatureAlgorithmsExtension {
+	if signatureAlgorithms == "" {
+		return &utls.SignatureAlgorithmsExtension{
 			SupportedSignatureAlgorithms: []utls.SignatureScheme{
 				utls.ECDSAWithP256AndSHA256,
 				utls.ECDSAWithP384AndSHA384,
@@ -929,7 +924,34 @@ func genMap(disableGrease bool) (extMap map[string]utls.TLSExtension) {
 				utls.ECDSAWithSHA1,
 				utls.PKCS1WithSHA1,
 			},
-		},
+		}
+	} else {
+		sigStrs := strings.Split(signatureAlgorithms, ",")
+		sigSchemes := []utls.SignatureScheme{}
+		for _, sigStr := range sigStrs {
+			// Parse hex string (may or may not have 0x prefix)
+			sigStr = strings.TrimPrefix(sigStr, "0x")
+			sig, err := strconv.ParseUint(sigStr, 16, 16)
+			if err != nil {
+				return nil
+			}
+			sigSchemes = append(sigSchemes, utls.SignatureScheme(sig))
+		}
+
+		return &utls.SignatureAlgorithmsExtension{
+			SupportedSignatureAlgorithms: sigSchemes,
+		}
+	}
+}
+
+func genMap(disableGrease bool, signatureAlgorithms string) (extMap map[string]utls.TLSExtension) {
+	extMap = map[string]utls.TLSExtension{
+		"0": &utls.SNIExtension{},
+		"5": &utls.StatusRequestExtension{},
+		// These are applied later
+		// "10": &tls.SupportedCurvesExtension{...}
+		// "11": &tls.SupportedPointsExtension{...}
+		"13": getSignatureAlgorithmsExtension(signatureAlgorithms),
 		"16": &utls.ALPNExtension{
 			AlpnProtocols: []string{"h2", "http/1.1"},
 		},
@@ -1045,10 +1067,10 @@ func CreateUQuicSpecFromJA4(ja4r string) (*uquic.QUICSpec, error) {
 	// For now, we use Chrome_115 as the base QUIC spec since it's the most compatible
 	// TODO: In the future, this could be enhanced to create custom QUIC specs
 	// based on the specific JA4 characteristics once more QUIC specs are available
-	
+
 	// Log the JA4 characteristics for future enhancement
 	_ = components // Keep this to show JA4 parsing works
-	
+
 	// Use the proven Chrome 115 QUIC spec as it works well with modern servers
 	spec, err := uquic.QUICID2Spec(uquic.QUICChrome_115)
 	if err != nil {
@@ -1058,10 +1080,8 @@ func CreateUQuicSpecFromJA4(ja4r string) (*uquic.QUICSpec, error) {
 	return &spec, nil
 }
 
-
-
 // QUICStringToSpec creates a ClientHelloSpec based on a QUIC fingerprint string
-func QUICStringToSpec(quicFingerprint string, userAgent string, forceHTTP1 bool) (*utls.ClientHelloSpec, error) {
+func QUICStringToSpec(quicFingerprint string, userAgent string, forceHTTP1 bool, signatureAlgorithms string) (*utls.ClientHelloSpec, error) {
 	if quicFingerprint == "" {
 		return nil, errors.New("empty QUIC fingerprint")
 	}
@@ -1072,7 +1092,7 @@ func QUICStringToSpec(quicFingerprint string, userAgent string, forceHTTP1 bool)
 	}
 
 	parsedUserAgent := parseUserAgent(userAgent)
-	extMap := genMap(false)
+	extMap := genMap(false, signatureAlgorithms)
 
 	// Default to TLS 1.3 for QUIC (as QUIC typically uses TLS 1.3)
 	var tlsVersion uint16 = utls.VersionTLS13

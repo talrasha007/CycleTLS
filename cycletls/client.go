@@ -4,13 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	fhttp "github.com/Danny-Dasilva/fhttp"
 	"sync"
 	"time"
 
+	fhttp "github.com/Danny-Dasilva/fhttp"
+
 	"github.com/gorilla/websocket"
-	utls "github.com/refraction-networking/utls"
 	uquic "github.com/refraction-networking/uquic"
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/proxy"
 )
 
@@ -35,12 +36,13 @@ var (
 
 type Browser struct {
 	// TLS fingerprinting options
-	JA3              string
-	JA4r             string // JA4 raw format with explicit cipher/extension values
-	HTTP2Fingerprint string
-	QUICFingerprint  string
-	USpec            *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
-	DisableGrease    bool
+	SignatureAlgorithms string
+	JA3                 string
+	JA4r                string // JA4 raw format with explicit cipher/extension values
+	HTTP2Fingerprint    string
+	QUICFingerprint     string
+	USpec               *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
+	DisableGrease       bool
 
 	// Browser identification
 	UserAgent string
@@ -52,7 +54,7 @@ type Browser struct {
 	ForceHTTP3         bool
 
 	// TLS 1.3 specific options
-	TLS13AutoRetry     bool
+	TLS13AutoRetry bool
 
 	// Ordered HTTP header fields
 	HeaderOrder []string

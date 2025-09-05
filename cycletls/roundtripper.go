@@ -5,18 +5,19 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	http "github.com/Danny-Dasilva/fhttp"
-	http2 "github.com/Danny-Dasilva/fhttp/http2"
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	utls "github.com/refraction-networking/utls"
-	uquic "github.com/refraction-networking/uquic"
-	"golang.org/x/net/proxy"
 	"net"
 	stdhttp "net/http"
 	"strings"
 	"sync"
 	"time"
+
+	http "github.com/Danny-Dasilva/fhttp"
+	http2 "github.com/Danny-Dasilva/fhttp/http2"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	uquic "github.com/refraction-networking/uquic"
+	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/proxy"
 )
 
 var errProtocolNegotiated = errors.New("protocol negotiated")
@@ -25,12 +26,13 @@ type roundTripper struct {
 	sync.Mutex
 
 	// TLS fingerprinting options
-	JA3              string
-	JA4r             string // JA4 raw format with explicit cipher/extension values
-	HTTP2Fingerprint string
-	QUICFingerprint  string
-	USpec            *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
-	DisableGrease    bool
+	SignatureAlgorithms string
+	JA3                 string
+	JA4r                string // JA4 raw format with explicit cipher/extension values
+	HTTP2Fingerprint    string
+	QUICFingerprint     string
+	USpec               *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
+	DisableGrease       bool
 
 	// Browser identification
 	UserAgent   string
@@ -44,7 +46,7 @@ type roundTripper struct {
 	ForceHTTP3         bool
 
 	// TLS 1.3 specific options
-	TLS13AutoRetry     bool
+	TLS13AutoRetry bool
 
 	// Caching
 	cachedConnections map[string]net.Conn
@@ -218,7 +220,7 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 	// Determine which fingerprint to use
 	if rt.QUICFingerprint != "" {
 		// Use QUIC fingerprint
-		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1)
+		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 		if err != nil {
 			return nil, err
 		}
@@ -226,11 +228,11 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		// Check if we should proactively upgrade TLS 1.2 to TLS 1.3
 		if rt.TLS13AutoRetry && strings.HasPrefix(rt.JA3, "771,") {
 			// Use TLS 1.3 compatible spec to avoid retry cycle
-			spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1)
+			spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 			proactivelyUpgraded = true
 		} else {
 			// Use original JA3 fingerprint
-			spec, err = StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1)
+			spec, err = StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 		}
 		if err != nil {
 			return nil, err
@@ -243,7 +245,7 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		}
 	} else {
 		// Default to Chrome fingerprint
-		spec, err = StringToSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1)
+		spec, err = StringToSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 		if err != nil {
 			return nil, err
 		}
@@ -273,12 +275,12 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 			}
 			return nil, fmt.Errorf("conn.Handshake() error for TLS 1.3 (retry disabled): %+v", err)
 		}
-		
+
 		// If we proactively upgraded to TLS 1.3 and it failed, try falling back to original TLS 1.2 JA3
 		if proactivelyUpgraded && rt.JA3 != "" {
 			return rt.retryWithOriginalTLS12JA3(ctx, network, addr, host)
 		}
-		
+
 		return nil, fmt.Errorf("uTlsConn.Handshake() error: %+v", err)
 	}
 
@@ -346,25 +348,25 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	// Use TLS 1.3 compatible spec based on the original fingerprint type
 	if rt.QUICFingerprint != "" {
 		// For QUIC, we'll use the original spec but this could be enhanced
-		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1)
+		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create QUIC spec for TLS 1.3 retry: %v", err)
 		}
 	} else if rt.JA3 != "" {
 		// Use TLS 1.3 compatible JA3 spec
-		spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1)
+		spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible JA3 spec: %v", err)
 		}
 	} else if rt.JA4r != "" {
 		// For JA4r, we'll use a fallback to default Chrome with TLS 1.3 compatible curves
-		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1)
+		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible JA4 fallback spec: %v", err)
 		}
 	} else {
 		// Default to TLS 1.3 compatible Chrome fingerprint
-		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1)
+		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible default spec: %v", err)
 		}
@@ -440,7 +442,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	}
 
 	// Use original TLS 1.2 JA3 spec (no upgrade)
-	spec, err := StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1)
+	spec, err := StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create original TLS 1.2 JA3 spec: %v", err)
 	}
@@ -552,25 +554,26 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 	}
 
 	return &roundTripper{
-		dialer:             contextDialer,
-		JA3:                browser.JA3,
-		JA4r:               browser.JA4r,
-		HTTP2Fingerprint:   browser.HTTP2Fingerprint,
-		QUICFingerprint:    browser.QUICFingerprint,
-		USpec:              browser.USpec, // Add USpec field initialization
-		DisableGrease:      browser.DisableGrease,
-		UserAgent:          browser.UserAgent,
-		HeaderOrder:        browser.HeaderOrder,
-		TLSConfig:          browser.TLSConfig,
-		Cookies:            browser.Cookies,
-		cachedTransports:   make(map[string]http.RoundTripper),
-		cachedConnections:  make(map[string]net.Conn),
-		InsecureSkipVerify: browser.InsecureSkipVerify,
-		ForceHTTP1:         browser.ForceHTTP1,
-		ForceHTTP3:         browser.ForceHTTP3,
+		dialer:              contextDialer,
+		SignatureAlgorithms: browser.SignatureAlgorithms,
+		JA3:                 browser.JA3,
+		JA4r:                browser.JA4r,
+		HTTP2Fingerprint:    browser.HTTP2Fingerprint,
+		QUICFingerprint:     browser.QUICFingerprint,
+		USpec:               browser.USpec, // Add USpec field initialization
+		DisableGrease:       browser.DisableGrease,
+		UserAgent:           browser.UserAgent,
+		HeaderOrder:         browser.HeaderOrder,
+		TLSConfig:           browser.TLSConfig,
+		Cookies:             browser.Cookies,
+		cachedTransports:    make(map[string]http.RoundTripper),
+		cachedConnections:   make(map[string]net.Conn),
+		InsecureSkipVerify:  browser.InsecureSkipVerify,
+		ForceHTTP1:          browser.ForceHTTP1,
+		ForceHTTP3:          browser.ForceHTTP3,
 
 		// TLS 1.3 specific options
-		TLS13AutoRetry:     browser.TLS13AutoRetry,
+		TLS13AutoRetry: browser.TLS13AutoRetry,
 	}
 }
 
@@ -581,7 +584,7 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{}
 	}
-	
+
 	// Create HTTP/3 Transport - let it establish its own connections for now
 	roundTripper := &http3.Transport{
 		TLSClientConfig: tlsConfig,
@@ -600,7 +603,7 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 			Allow0RTT:                      false,
 		},
 	}
-	
+
 	// Convert fhttp.Request to net/http.Request
 	stdReq := &stdhttp.Request{
 		Method:           req.Method,
@@ -625,13 +628,13 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 		Cancel:           req.Cancel,
 		Response:         nil,
 	}
-	
+
 	// Use the RoundTripper to make the request
 	stdResp, err := roundTripper.RoundTrip(stdReq)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Convert back to fhttp.Response
 	return &http.Response{
 		Status:           stdResp.Status,
@@ -653,4 +656,3 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 
 // Default JA3 fingerprint for Chrome
 const DefaultChrome_JA3 = "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513,29-23-24,0"
-
