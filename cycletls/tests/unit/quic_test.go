@@ -14,7 +14,7 @@ const (
 
 func TestQUICStringToSpec(t *testing.T) {
 	// Test with valid QUIC fingerprint
-	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, TestUserAgent, false)
+	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, TestUserAgent, false, "")
 	if err != nil {
 		t.Errorf("QUICStringToSpec failed: %v", err)
 	}
@@ -66,7 +66,7 @@ func TestQUICStringToSpec(t *testing.T) {
 
 func TestQUICStringToSpecWithForceHTTP1(t *testing.T) {
 	// Test QUIC fingerprint with forceHTTP1 = true (unusual but should work)
-	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, TestUserAgent, true)
+	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, TestUserAgent, true, "")
 	if err != nil {
 		t.Errorf("QUICStringToSpec with forceHTTP1 failed: %v", err)
 	}
@@ -95,7 +95,7 @@ func TestQUICStringToSpecWithForceHTTP1(t *testing.T) {
 
 func TestQUICStringToSpecEmptyFingerprint(t *testing.T) {
 	// Test with empty QUIC fingerprint
-	_, err := cycletls.QUICStringToSpec("", TestUserAgent, false)
+	_, err := cycletls.QUICStringToSpec("", TestUserAgent, false, "")
 	if err == nil {
 		t.Error("QUICStringToSpec should fail with empty fingerprint")
 	}
@@ -108,7 +108,7 @@ func TestQUICStringToSpecEmptyFingerprint(t *testing.T) {
 
 func TestQUICStringToSpecShortFingerprint(t *testing.T) {
 	// Test with too short QUIC fingerprint
-	_, err := cycletls.QUICStringToSpec("123", TestUserAgent, false)
+	_, err := cycletls.QUICStringToSpec("123", TestUserAgent, false, "")
 	if err == nil {
 		t.Error("QUICStringToSpec should fail with short fingerprint")
 	}
@@ -122,7 +122,7 @@ func TestQUICStringToSpecShortFingerprint(t *testing.T) {
 func TestQUICStringToSpecFirefoxUserAgent(t *testing.T) {
 	// Test with Firefox user agent
 	firefoxUA := "Mozilla/5.0 (X11; Linux x86_64; rv:109.0) Gecko/20100101 Firefox/116.0"
-	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, firefoxUA, false)
+	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, firefoxUA, false, "")
 	if err != nil {
 		t.Errorf("QUICStringToSpec with Firefox UA failed: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestQUICStringToSpecFirefoxUserAgent(t *testing.T) {
 
 func TestQUICStringToSpecValidatesTLS13(t *testing.T) {
 	// Verify that QUIC spec uses TLS 1.3 (as QUIC requires TLS 1.3)
-	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, TestUserAgent, false)
+	spec, err := cycletls.QUICStringToSpec(TestQUICFingerprint, TestUserAgent, false, "")
 	if err != nil {
 		t.Errorf("QUICStringToSpec failed: %v", err)
 	}
