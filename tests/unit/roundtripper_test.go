@@ -3,7 +3,7 @@ package unit
 import (
 	"testing"
 
-	cycletls "github.com/talrasha007/CycleTLS/cycletls"
+	cycletls "github.com/talrasha007/CycleTLS"
 )
 
 const (

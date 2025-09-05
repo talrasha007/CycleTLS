@@ -4,7 +4,7 @@ import (
 	"testing"
 
 	utls "github.com/refraction-networking/utls"
-	"github.com/talrasha007/CycleTLS/cycletls"
+	cycletls "github.com/talrasha007/CycleTLS"
 )
 
 const (

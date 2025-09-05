@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/talrasha007/CycleTLS/cycletls"
+	cycletls "github.com/talrasha007/CycleTLS"
 )
 
 func TestSomething(t *testing.T) {
