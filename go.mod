@@ -1,4 +1,4 @@
-module github.com/talrasha007/CycleTLS/cycletls
+module github.com/talrasha007/CycleTLS
 
 go 1.24
 
