@@ -7,6 +7,7 @@ import (
 	"flag"
 	"io"
 	"log"
+	"math/rand"
 	nhttp "net/http"
 	"net/url"
 	"os"
@@ -60,6 +61,7 @@ type Options struct {
 	BodyBytes []byte            `json:"bodyBytes"` // New field for binary request data
 
 	// TLS fingerprinting options
+	ShuffleExtensions        bool   `json:"shuffleExtensions"` // internal use only
 	EnableClientSessionCache bool   `json:"enableClientSessionCache"`
 	SignatureAlgorithms      string `json:"signatureAlgorithms"` // internal use only
 	Ja3                      string `json:"ja3"`
@@ -1318,6 +1320,21 @@ func (client CycleTLS) Close() {
 
 // Do creates a single HTTP request for integration tests
 func (client CycleTLS) Do(URL string, options Options, Method string) (Response, error) {
+	ja3 := options.Ja3
+	if ja3 != "" && options.ShuffleExtensions {
+		parts := strings.Split(ja3, ",")
+		if len(parts) >= 4 {
+			extensions := strings.Split(parts[2], "-")
+			rand.Shuffle(len(extensions), func(i, j int) {
+				if extensions[i] != "41" && extensions[j] != "41" { // Don't shuffle GREASE (41)
+					extensions[i], extensions[j] = extensions[j], extensions[i]
+				}
+			})
+			parts[2] = strings.Join(extensions, "-")
+			ja3 = strings.Join(parts, ",")
+			options.Ja3 = ja3
+		}
+	}
 	// Create browser from options
 	browser := Browser{
 		EnableClientSessionCache: options.EnableClientSessionCache,
