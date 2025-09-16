@@ -60,12 +60,13 @@ type Options struct {
 	BodyBytes []byte            `json:"bodyBytes"` // New field for binary request data
 
 	// TLS fingerprinting options
-	SignatureAlgorithms string `json:"signatureAlgorithms"` // internal use only
-	Ja3                 string `json:"ja3"`
-	Ja4r                string `json:"ja4r"` // JA4 raw format with explicit cipher/extension values
-	HTTP2Fingerprint    string `json:"http2Fingerprint"`
-	QUICFingerprint     string `json:"quicFingerprint"`
-	DisableGrease       bool   `json:"disableGrease"` // Disable GREASE for exact JA4 matching
+	EnableClientSessionCache bool   `json:"enableClientSessionCache"`
+	SignatureAlgorithms      string `json:"signatureAlgorithms"` // internal use only
+	Ja3                      string `json:"ja3"`
+	Ja4r                     string `json:"ja4r"` // JA4 raw format with explicit cipher/extension values
+	HTTP2Fingerprint         string `json:"http2Fingerprint"`
+	QUICFingerprint          string `json:"quicFingerprint"`
+	DisableGrease            bool   `json:"disableGrease"` // Disable GREASE for exact JA4 matching
 
 	// Browser identification
 	UserAgent string `json:"userAgent"`
@@ -121,12 +122,13 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 
 	var browser = Browser{
 		// TLS fingerprinting options
-		SignatureAlgorithms: request.Options.SignatureAlgorithms,
-		JA3:                 request.Options.Ja3,
-		JA4r:                request.Options.Ja4r,
-		HTTP2Fingerprint:    request.Options.HTTP2Fingerprint,
-		QUICFingerprint:     request.Options.QUICFingerprint,
-		DisableGrease:       request.Options.DisableGrease,
+		EnableClientSessionCache: request.Options.EnableClientSessionCache,
+		SignatureAlgorithms:      request.Options.SignatureAlgorithms,
+		JA3:                      request.Options.Ja3,
+		JA4r:                     request.Options.Ja4r,
+		HTTP2Fingerprint:         request.Options.HTTP2Fingerprint,
+		QUICFingerprint:          request.Options.QUICFingerprint,
+		DisableGrease:            request.Options.DisableGrease,
 
 		// Browser identification
 		UserAgent: request.Options.UserAgent,
@@ -1318,17 +1320,18 @@ func (client CycleTLS) Close() {
 func (client CycleTLS) Do(URL string, options Options, Method string) (Response, error) {
 	// Create browser from options
 	browser := Browser{
-		SignatureAlgorithms: options.SignatureAlgorithms,
-		JA3:                 options.Ja3,
-		JA4r:                options.Ja4r,
-		HTTP2Fingerprint:    options.HTTP2Fingerprint,
-		QUICFingerprint:     options.QUICFingerprint,
-		UserAgent:           options.UserAgent,
-		Cookies:             options.Cookies,
-		InsecureSkipVerify:  options.InsecureSkipVerify,
-		ForceHTTP1:          options.ForceHTTP1,
-		ForceHTTP3:          options.ForceHTTP3,
-		HeaderOrder:         options.HeaderOrder,
+		EnableClientSessionCache: options.EnableClientSessionCache,
+		SignatureAlgorithms:      options.SignatureAlgorithms,
+		JA3:                      options.Ja3,
+		JA4r:                     options.Ja4r,
+		HTTP2Fingerprint:         options.HTTP2Fingerprint,
+		QUICFingerprint:          options.QUICFingerprint,
+		UserAgent:                options.UserAgent,
+		Cookies:                  options.Cookies,
+		InsecureSkipVerify:       options.InsecureSkipVerify,
+		ForceHTTP1:               options.ForceHTTP1,
+		ForceHTTP3:               options.ForceHTTP3,
+		HeaderOrder:              options.HeaderOrder,
 	}
 
 	// Note: Don't automatically set HeaderOrder from UserAgent here as it can interfere with connection management

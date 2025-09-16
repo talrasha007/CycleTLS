@@ -21,18 +21,20 @@ import (
 )
 
 var errProtocolNegotiated = errors.New("protocol negotiated")
+var globalClientSessionCache = utls.NewLRUClientSessionCache(512)
 
 type roundTripper struct {
 	sync.Mutex
 
 	// TLS fingerprinting options
-	SignatureAlgorithms string
-	JA3                 string
-	JA4r                string // JA4 raw format with explicit cipher/extension values
-	HTTP2Fingerprint    string
-	QUICFingerprint     string
-	USpec               *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
-	DisableGrease       bool
+	EnableClientSessionCache bool
+	SignatureAlgorithms      string
+	JA3                      string
+	JA4r                     string // JA4 raw format with explicit cipher/extension values
+	HTTP2Fingerprint         string
+	QUICFingerprint          string
+	USpec                    *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
+	DisableGrease            bool
 
 	// Browser identification
 	UserAgent   string
@@ -251,11 +253,17 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		}
 	}
 
+	var clientSessionCache utls.ClientSessionCache
+	if rt.EnableClientSessionCache {
+		clientSessionCache = globalClientSessionCache
+	}
+
 	// Create TLS client
 	conn := utls.UClient(rawConn, &utls.Config{
 		ServerName:         host,
 		OmitEmptyPsk:       true,
 		InsecureSkipVerify: rt.InsecureSkipVerify,
+		ClientSessionCache: clientSessionCache,
 	}, utls.HelloCustom)
 
 	// Apply TLS fingerprint
@@ -554,23 +562,24 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 	}
 
 	return &roundTripper{
-		dialer:              contextDialer,
-		SignatureAlgorithms: browser.SignatureAlgorithms,
-		JA3:                 browser.JA3,
-		JA4r:                browser.JA4r,
-		HTTP2Fingerprint:    browser.HTTP2Fingerprint,
-		QUICFingerprint:     browser.QUICFingerprint,
-		USpec:               browser.USpec, // Add USpec field initialization
-		DisableGrease:       browser.DisableGrease,
-		UserAgent:           browser.UserAgent,
-		HeaderOrder:         browser.HeaderOrder,
-		TLSConfig:           browser.TLSConfig,
-		Cookies:             browser.Cookies,
-		cachedTransports:    make(map[string]http.RoundTripper),
-		cachedConnections:   make(map[string]net.Conn),
-		InsecureSkipVerify:  browser.InsecureSkipVerify,
-		ForceHTTP1:          browser.ForceHTTP1,
-		ForceHTTP3:          browser.ForceHTTP3,
+		dialer:                   contextDialer,
+		EnableClientSessionCache: browser.EnableClientSessionCache,
+		SignatureAlgorithms:      browser.SignatureAlgorithms,
+		JA3:                      browser.JA3,
+		JA4r:                     browser.JA4r,
+		HTTP2Fingerprint:         browser.HTTP2Fingerprint,
+		QUICFingerprint:          browser.QUICFingerprint,
+		USpec:                    browser.USpec, // Add USpec field initialization
+		DisableGrease:            browser.DisableGrease,
+		UserAgent:                browser.UserAgent,
+		HeaderOrder:              browser.HeaderOrder,
+		TLSConfig:                browser.TLSConfig,
+		Cookies:                  browser.Cookies,
+		cachedTransports:         make(map[string]http.RoundTripper),
+		cachedConnections:        make(map[string]net.Conn),
+		InsecureSkipVerify:       browser.InsecureSkipVerify,
+		ForceHTTP1:               browser.ForceHTTP1,
+		ForceHTTP3:               browser.ForceHTTP3,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: browser.TLS13AutoRetry,

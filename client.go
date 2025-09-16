@@ -36,13 +36,14 @@ var (
 
 type Browser struct {
 	// TLS fingerprinting options
-	SignatureAlgorithms string
-	JA3                 string
-	JA4r                string // JA4 raw format with explicit cipher/extension values
-	HTTP2Fingerprint    string
-	QUICFingerprint     string
-	USpec               *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
-	DisableGrease       bool
+	EnableClientSessionCache bool
+	SignatureAlgorithms      string
+	JA3                      string
+	JA4r                     string // JA4 raw format with explicit cipher/extension values
+	HTTP2Fingerprint         string
+	QUICFingerprint          string
+	USpec                    *uquic.QUICSpec // UQuic QUIC specification for HTTP3 fingerprinting
+	DisableGrease            bool
 
 	// Browser identification
 	UserAgent string
