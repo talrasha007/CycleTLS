@@ -21,7 +21,7 @@ import (
 )
 
 var errProtocolNegotiated = errors.New("protocol negotiated")
-var globalClientSessionCache = utls.NewLRUClientSessionCache(512)
+var globalClientSessionCache = utls.NewLRUClientSessionCache(16384)
 
 type roundTripper struct {
 	sync.Mutex
