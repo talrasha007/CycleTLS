@@ -133,13 +133,13 @@ func unBrotliData(data []byte) (resData []byte, err error) {
 }
 
 // StringToSpec creates a ClientHelloSpec based on a JA3 string
-func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string) (*utls.ClientHelloSpec, error) {
+func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (*utls.ClientHelloSpec, error) {
 	parsedUserAgent := parseUserAgent(userAgent)
 	// if tlsExtensions == nil {
 	// 	tlsExtensions = &TLSExtensions{}
 	// }
 	// ext := tlsExtensions
-	extMap := genMap(false, signatureAlgorithms)
+	extMap := genMap(false, signatureAlgorithms, paddingExtension)
 	tokens := strings.Split(ja3, ",")
 
 	version := tokens[0]
@@ -275,10 +275,10 @@ func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgori
 }
 
 // StringToTLS13CompatibleSpec creates a TLS 1.3 compatible ClientHelloSpec by filtering curves
-func StringToTLS13CompatibleSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string) (*utls.ClientHelloSpec, error) {
+func StringToTLS13CompatibleSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (*utls.ClientHelloSpec, error) {
 	// For TLS 1.3 compatibility, we use only widely supported curves: X25519 (29) and secp256r1 (23)
 	tls13CompatibleJA3 := convertJA3ForTLS13(ja3)
-	return StringToSpec(tls13CompatibleJA3, userAgent, forceHTTP1, signatureAlgorithms)
+	return StringToSpec(tls13CompatibleJA3, userAgent, forceHTTP1, signatureAlgorithms, paddingExtension)
 }
 
 // convertJA3ForTLS13 converts a JA3 string to use TLS 1.3 compatible curves
@@ -944,7 +944,11 @@ func getSignatureAlgorithmsExtension(signatureAlgorithms string) *utls.Signature
 	}
 }
 
-func genMap(disableGrease bool, signatureAlgorithms string) (extMap map[string]utls.TLSExtension) {
+func genMap(disableGrease bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (extMap map[string]utls.TLSExtension) {
+	if paddingExtension == nil {
+		paddingExtension = &utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle}
+	}
+
 	extMap = map[string]utls.TLSExtension{
 		"0": &utls.SNIExtension{},
 		"5": &utls.StatusRequestExtension{},
@@ -957,7 +961,7 @@ func genMap(disableGrease bool, signatureAlgorithms string) (extMap map[string]u
 		},
 		"17": &utls.GenericExtension{Id: 17}, // status_request_v2
 		"18": &utls.SCTExtension{},
-		"21": &utls.UtlsPaddingExtension{GetPaddingLen: utls.BoringPaddingStyle},
+		"21": paddingExtension,
 		"22": &utls.GenericExtension{Id: 22}, // encrypt_then_mac
 		"23": &utls.ExtendedMasterSecretExtension{},
 		"24": &utls.FakeTokenBindingExtension{},
@@ -1081,7 +1085,7 @@ func CreateUQuicSpecFromJA4(ja4r string) (*uquic.QUICSpec, error) {
 }
 
 // QUICStringToSpec creates a ClientHelloSpec based on a QUIC fingerprint string
-func QUICStringToSpec(quicFingerprint string, userAgent string, forceHTTP1 bool, signatureAlgorithms string) (*utls.ClientHelloSpec, error) {
+func QUICStringToSpec(quicFingerprint string, userAgent string, forceHTTP1 bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (*utls.ClientHelloSpec, error) {
 	if quicFingerprint == "" {
 		return nil, errors.New("empty QUIC fingerprint")
 	}
@@ -1092,7 +1096,7 @@ func QUICStringToSpec(quicFingerprint string, userAgent string, forceHTTP1 bool,
 	}
 
 	parsedUserAgent := parseUserAgent(userAgent)
-	extMap := genMap(false, signatureAlgorithms)
+	extMap := genMap(false, signatureAlgorithms, paddingExtension)
 
 	// Default to TLS 1.3 for QUIC (as QUIC typically uses TLS 1.3)
 	var tlsVersion uint16 = utls.VersionTLS13

@@ -37,6 +37,7 @@ var (
 type Browser struct {
 	// TLS fingerprinting options
 	EnableClientSessionCache bool
+	PaddingExtension         *utls.UtlsPaddingExtension
 	SignatureAlgorithms      string
 	JA3                      string
 	JA4r                     string // JA4 raw format with explicit cipher/extension values

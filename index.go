@@ -61,6 +61,7 @@ type Options struct {
 	BodyBytes []byte            `json:"bodyBytes"` // New field for binary request data
 
 	// TLS fingerprinting options
+	PaddingExtension         *utls.UtlsPaddingExtension
 	ShuffleExtensions        bool   `json:"shuffleExtensions"` // internal use only
 	EnableClientSessionCache bool   `json:"enableClientSessionCache"`
 	SignatureAlgorithms      string `json:"signatureAlgorithms"` // internal use only
@@ -124,6 +125,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 
 	var browser = Browser{
 		// TLS fingerprinting options
+		PaddingExtension:         request.Options.PaddingExtension,
 		EnableClientSessionCache: request.Options.EnableClientSessionCache,
 		SignatureAlgorithms:      request.Options.SignatureAlgorithms,
 		JA3:                      request.Options.Ja3,
@@ -285,12 +287,14 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	// Create browser configuration for HTTP/3
 	var browser = Browser{
 		// TLS fingerprinting options
-		SignatureAlgorithms: request.Options.SignatureAlgorithms,
-		JA3:                 request.Options.Ja3,
-		JA4r:                request.Options.Ja4r,
-		HTTP2Fingerprint:    request.Options.HTTP2Fingerprint,
-		QUICFingerprint:     request.Options.QUICFingerprint,
-		DisableGrease:       request.Options.DisableGrease,
+		PaddingExtension:         request.Options.PaddingExtension,
+		EnableClientSessionCache: request.Options.EnableClientSessionCache,
+		SignatureAlgorithms:      request.Options.SignatureAlgorithms,
+		JA3:                      request.Options.Ja3,
+		JA4r:                     request.Options.Ja4r,
+		HTTP2Fingerprint:         request.Options.HTTP2Fingerprint,
+		QUICFingerprint:          request.Options.QUICFingerprint,
+		DisableGrease:            request.Options.DisableGrease,
 
 		// Browser identification
 		UserAgent: request.Options.UserAgent,
@@ -368,12 +372,14 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 	// Create browser configuration for SSE
 	var browser = Browser{
 		// TLS fingerprinting options
-		SignatureAlgorithms: request.Options.SignatureAlgorithms,
-		JA3:                 request.Options.Ja3,
-		JA4r:                request.Options.Ja4r,
-		HTTP2Fingerprint:    request.Options.HTTP2Fingerprint,
-		QUICFingerprint:     request.Options.QUICFingerprint,
-		DisableGrease:       request.Options.DisableGrease,
+		PaddingExtension:         request.Options.PaddingExtension,
+		EnableClientSessionCache: request.Options.EnableClientSessionCache,
+		SignatureAlgorithms:      request.Options.SignatureAlgorithms,
+		JA3:                      request.Options.Ja3,
+		JA4r:                     request.Options.Ja4r,
+		HTTP2Fingerprint:         request.Options.HTTP2Fingerprint,
+		QUICFingerprint:          request.Options.QUICFingerprint,
+		DisableGrease:            request.Options.DisableGrease,
 
 		// Browser identification
 		UserAgent: request.Options.UserAgent,
@@ -444,12 +450,14 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 	// Create browser configuration for WebSocket
 	var browser = Browser{
 		// TLS fingerprinting options
-		SignatureAlgorithms: request.Options.SignatureAlgorithms,
-		JA3:                 request.Options.Ja3,
-		JA4r:                request.Options.Ja4r,
-		HTTP2Fingerprint:    request.Options.HTTP2Fingerprint,
-		QUICFingerprint:     request.Options.QUICFingerprint,
-		DisableGrease:       request.Options.DisableGrease,
+		PaddingExtension:         request.Options.PaddingExtension,
+		EnableClientSessionCache: request.Options.EnableClientSessionCache,
+		SignatureAlgorithms:      request.Options.SignatureAlgorithms,
+		JA3:                      request.Options.Ja3,
+		JA4r:                     request.Options.Ja4r,
+		HTTP2Fingerprint:         request.Options.HTTP2Fingerprint,
+		QUICFingerprint:          request.Options.QUICFingerprint,
+		DisableGrease:            request.Options.DisableGrease,
 
 		// Browser identification
 		UserAgent: request.Options.UserAgent,
@@ -1337,6 +1345,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	}
 	// Create browser from options
 	browser := Browser{
+		PaddingExtension:         options.PaddingExtension,
 		EnableClientSessionCache: options.EnableClientSessionCache,
 		SignatureAlgorithms:      options.SignatureAlgorithms,
 		JA3:                      options.Ja3,

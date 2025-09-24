@@ -27,6 +27,7 @@ type roundTripper struct {
 	sync.Mutex
 
 	// TLS fingerprinting options
+	PaddingExtension         *utls.UtlsPaddingExtension
 	EnableClientSessionCache bool
 	SignatureAlgorithms      string
 	JA3                      string
@@ -222,7 +223,7 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 	// Determine which fingerprint to use
 	if rt.QUICFingerprint != "" {
 		// Use QUIC fingerprint
-		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, err
 		}
@@ -230,11 +231,11 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		// Check if we should proactively upgrade TLS 1.2 to TLS 1.3
 		if rt.TLS13AutoRetry && strings.HasPrefix(rt.JA3, "771,") {
 			// Use TLS 1.3 compatible spec to avoid retry cycle
-			spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+			spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 			proactivelyUpgraded = true
 		} else {
 			// Use original JA3 fingerprint
-			spec, err = StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+			spec, err = StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		}
 		if err != nil {
 			return nil, err
@@ -247,7 +248,7 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		}
 	} else {
 		// Default to Chrome fingerprint
-		spec, err = StringToSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+		spec, err = StringToSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, err
 		}
@@ -356,25 +357,25 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	// Use TLS 1.3 compatible spec based on the original fingerprint type
 	if rt.QUICFingerprint != "" {
 		// For QUIC, we'll use the original spec but this could be enhanced
-		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+		spec, err = QUICStringToSpec(rt.QUICFingerprint, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create QUIC spec for TLS 1.3 retry: %v", err)
 		}
 	} else if rt.JA3 != "" {
 		// Use TLS 1.3 compatible JA3 spec
-		spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+		spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible JA3 spec: %v", err)
 		}
 	} else if rt.JA4r != "" {
 		// For JA4r, we'll use a fallback to default Chrome with TLS 1.3 compatible curves
-		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible JA4 fallback spec: %v", err)
 		}
 	} else {
 		// Default to TLS 1.3 compatible Chrome fingerprint
-		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible default spec: %v", err)
 		}
@@ -450,7 +451,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	}
 
 	// Use original TLS 1.2 JA3 spec (no upgrade)
-	spec, err := StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms)
+	spec, err := StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create original TLS 1.2 JA3 spec: %v", err)
 	}
@@ -565,6 +566,7 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 		dialer:                   contextDialer,
 		EnableClientSessionCache: browser.EnableClientSessionCache,
 		SignatureAlgorithms:      browser.SignatureAlgorithms,
+		PaddingExtension:         browser.PaddingExtension,
 		JA3:                      browser.JA3,
 		JA4r:                     browser.JA4r,
 		HTTP2Fingerprint:         browser.HTTP2Fingerprint,
