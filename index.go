@@ -1420,6 +1420,13 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	}
 	defer resp.Body.Close()
 
+	if !enableConnectionReuse {
+		// Use type assertion to access the roundTripper
+		if transport, ok := httpClient.Transport.(*roundTripper); ok {
+			transport.CloseIdleConnections() // Close all idle connections
+		}
+	}
+
 	// Read body
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
