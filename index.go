@@ -93,6 +93,8 @@ type Options struct {
 
 	// Connection reuse options
 	EnableConnectionReuse bool `json:"enableConnectionReuse"` // Enable connection reuse across requests (default: true)
+
+	MaxResponseBodySize int64 `json:"maxResponseBodySize"` // Maximum response body size in bytes (default: unlimited)
 }
 
 type cycleTLSRequest struct {
@@ -1427,18 +1429,28 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		}
 	}
 
-	// Read body
-	bodyBytes, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return Response{}, err
-	}
+	var bodyBytes []byte
+	if options.MaxResponseBodySize < 0 {
+		// Read body
+		bodyBytes, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return Response{}, err
+		}
 
-	// Automatic decompression (axios-style) - check Content-Encoding header
-	encoding := resp.Header["Content-Encoding"]
-	content := resp.Header["Content-Type"]
-	if len(encoding) > 0 {
-		// Automatically decompress the body like axios does
-		bodyBytes = DecompressBody(bodyBytes, encoding, content)
+		// Automatic decompression (axios-style) - check Content-Encoding header
+		encoding := resp.Header["Content-Encoding"]
+		content := resp.Header["Content-Type"]
+		if len(encoding) > 0 {
+			// Automatically decompress the body like axios does
+			bodyBytes = DecompressBody(bodyBytes, encoding, content)
+		}
+	} else if options.MaxResponseBodySize > 0 {
+		// Read up to MaxResponseBodySize bytes
+		limitedReader := io.LimitReader(resp.Body, options.MaxResponseBodySize)
+		bodyBytes, err = io.ReadAll(limitedReader)
+		if err != nil {
+			return Response{}, err
+		}
 	}
 
 	// Convert headers
