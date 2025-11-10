@@ -158,11 +158,21 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Use cached transport if available, otherwise create a new one
+	cached, err := rt.GetCached(req, addr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Perform the request
+	return cached.RoundTrip(req)
+}
+
+func (rt *roundTripper) GetCached(req *http.Request, addr string) (http.RoundTripper, error) {
 	rt.Lock()
 	defer rt.Unlock()
 
 	if cached, ok := rt.cachedTransports[addr]; ok {
-		return cached.RoundTrip(req)
+		return cached, nil
 	}
 
 	if err := rt.getTransport(req, addr); err != nil {
@@ -170,7 +180,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Perform the request
-	return rt.cachedTransports[addr].RoundTrip(req)
+	return rt.cachedTransports[addr], nil
 }
 
 func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
