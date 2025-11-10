@@ -267,6 +267,9 @@ func CleanupClientPool(maxAge time.Duration) {
 	now := time.Now()
 	for key, entry := range advancedClientPool {
 		if now.Sub(entry.LastUsed) > maxAge {
+			if transport, ok := entry.Client.Transport.(*roundTripper); ok {
+				transport.CloseIdleConnections()
+			}
 			delete(advancedClientPool, key)
 		}
 	}
