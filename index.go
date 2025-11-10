@@ -1426,7 +1426,17 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 			Body:   parsedError.ErrorMsg + " -> " + err.Error(),
 		}, nil
 	}
-	defer resp.Body.Close()
+
+	defer func() {
+		resp.Body.Close()
+		if transport, ok := httpClient.Transport.(*roundTripper); ok {
+			if !enableConnectionReuse || (options.MaxTotalRequests > 0 && transport.TotalRequests > options.MaxTotalRequests) {
+				// Use type assertion to access the roundTripper
+				transport.TotalRequests = 0
+				transport.CloseIdleConnections() // Close all idle connections
+			}
+		}
+	}()
 
 	var bodyBytes []byte
 	if options.MaxResponseBodySize < 0 {
@@ -1484,14 +1494,6 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 			Unparsed:   cookie.Unparsed,
 		}
 		netCookies = append(netCookies, netCookie)
-	}
-
-	if transport, ok := httpClient.Transport.(*roundTripper); ok {
-		if !enableConnectionReuse || (options.MaxTotalRequests > 0 && transport.TotalRequests > options.MaxTotalRequests) {
-			// Use type assertion to access the roundTripper
-			transport.TotalRequests = 0
-			transport.CloseIdleConnections() // Close all idle connections
-		}
 	}
 
 	return Response{
