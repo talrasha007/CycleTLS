@@ -1487,7 +1487,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	}
 
 	if transport, ok := httpClient.Transport.(*roundTripper); ok {
-		if !enableConnectionReuse || transport.TotalRequests > options.MaxTotalRequests {
+		if !enableConnectionReuse || (options.MaxTotalRequests > 0 && transport.TotalRequests > options.MaxTotalRequests) {
 			// Use type assertion to access the roundTripper
 			transport.TotalRequests = 0
 			transport.CloseIdleConnections() // Close all idle connections
