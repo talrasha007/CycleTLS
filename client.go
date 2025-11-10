@@ -160,7 +160,7 @@ func NewTransportWithProxy(ja3 string, useragent string, proxy proxy.ContextDial
 }
 
 // generateClientKey creates a unique key for client pooling based on browser configuration
-func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxyURL string) string {
+func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string) string {
 	// Create cookie signature for the key
 	cookieStr := ""
 	for _, cookie := range browser.Cookies {
@@ -168,7 +168,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 	}
 
 	// Create a hash of the configuration that affects connection behavior
-	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
+	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s|meta:%s",
 		browser.JA3,
 		browser.JA4r,
 		browser.HTTP2Fingerprint,
@@ -181,6 +181,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 		browser.ForceHTTP1,
 		browser.ForceHTTP3,
 		cookieStr,
+		meta,
 	)
 
 	// Generate SHA256 hash for the key
@@ -189,7 +190,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, proxy
 }
 
 // getOrCreateClient retrieves a client from the pool or creates a new one
-func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, proxyURL ...string) (fhttp.Client, error) {
+func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
 	// If connection reuse is disabled, always create a new client
 	if !enableConnectionReuse {
 		return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
@@ -200,7 +201,7 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 		proxy = proxyURL[0]
 	}
 
-	clientKey := generateClientKey(browser, timeout, disableRedirect, proxy)
+	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxy)
 
 	// Try to get existing client from pool
 	advancedClientPoolMutex.RLock()
@@ -292,14 +293,14 @@ func clearAllConnections() {
 }
 
 // newClient creates a new http client (backward compatibility - defaults to no connection reuse)
-func newClient(browser Browser, timeout int, disableRedirect bool, UserAgent string, proxyURL ...string) (fhttp.Client, error) {
+func newClient(browser Browser, timeout int, disableRedirect bool, UserAgent string, meta string, proxyURL ...string) (fhttp.Client, error) {
 	// Backward compatibility: default to no connection reuse for existing code
-	return getOrCreateClient(browser, timeout, disableRedirect, UserAgent, false, proxyURL...)
+	return getOrCreateClient(browser, timeout, disableRedirect, UserAgent, false, meta, proxyURL...)
 }
 
 // newClientWithReuse creates a new http client with configurable connection reuse
-func newClientWithReuse(browser Browser, timeout int, disableRedirect bool, UserAgent string, enableConnectionReuse bool, proxyURL ...string) (fhttp.Client, error) {
-	return getOrCreateClient(browser, timeout, disableRedirect, UserAgent, enableConnectionReuse, proxyURL...)
+func newClientWithReuse(browser Browser, timeout int, disableRedirect bool, UserAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
+	return getOrCreateClient(browser, timeout, disableRedirect, UserAgent, enableConnectionReuse, meta, proxyURL...)
 }
 
 // WebSocketConnect establishes a WebSocket connection
@@ -359,7 +360,7 @@ func (browser Browser) WebSocketConnect(ctx context.Context, urlStr string) (*we
 // SSEConnect establishes an SSE connection
 func (browser Browser) SSEConnect(ctx context.Context, urlStr string) (*SSEResponse, error) {
 	// Create HTTP client with connection reuse enabled
-	httpClient, err := newClientWithReuse(browser, 30, false, browser.UserAgent, true)
+	httpClient, err := newClientWithReuse(browser, 30, false, browser.UserAgent, true, "")
 	if err != nil {
 		return nil, err
 	}

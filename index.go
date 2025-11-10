@@ -94,7 +94,8 @@ type Options struct {
 	// Connection reuse options
 	EnableConnectionReuse bool `json:"enableConnectionReuse"` // Enable connection reuse across requests (default: true)
 
-	MaxResponseBodySize int64 `json:"maxResponseBodySize"` // Maximum response body size in bytes (default: unlimited)
+	Meta                string `json:"meta"`                // Arbitrary metadata for client connection pooling
+	MaxResponseBodySize int64  `json:"maxResponseBodySize"` // Maximum response body size in bytes (default: unlimited)
 }
 
 type cycleTLSRequest struct {
@@ -178,6 +179,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
 		enableConnectionReuse,
+		"",
 		request.Options.Proxy,
 	)
 	if err != nil {
@@ -327,6 +329,7 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
 		enableConnectionReuse,
+		"",
 		request.Options.Proxy,
 	)
 	if err != nil {
@@ -412,6 +415,7 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
 		enableConnectionReuse,
+		"",
 		request.Options.Proxy,
 	)
 	if err != nil {
@@ -1379,6 +1383,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		options.DisableRedirect,
 		options.UserAgent,
 		enableConnectionReuse,
+		options.Meta,
 		options.Proxy,
 	)
 	if err != nil {
