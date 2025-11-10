@@ -158,10 +158,15 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Use cached transport if available, otherwise create a new one
-	if _, ok := rt.cachedTransports[addr]; !ok {
-		if err := rt.getTransport(req, addr); err != nil {
-			return nil, err
-		}
+	rt.Lock()
+	defer rt.Unlock()
+
+	if cached, ok := rt.cachedTransports[addr]; ok {
+		return cached.RoundTrip(req)
+	}
+
+	if err := rt.getTransport(req, addr); err != nil {
+		return nil, err
 	}
 
 	// Perform the request
@@ -182,7 +187,7 @@ func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 	}
 
 	// Establish TLS connection
-	_, err := rt.dialTLS(req.Context(), "tcp", addr)
+	_, err := rt.dialTLSImpl(req.Context(), "tcp", addr)
 	switch err {
 	case errProtocolNegotiated:
 		// Expected behavior - transport has been cached
@@ -200,6 +205,10 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 	rt.Lock()
 	defer rt.Unlock()
 
+	return rt.dialTLSImpl(ctx, network, addr)
+}
+
+func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (net.Conn, error) {
 	// Return cached connection if available
 	if conn := rt.cachedConnections[addr]; conn != nil {
 		return conn, nil
