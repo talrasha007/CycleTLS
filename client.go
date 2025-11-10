@@ -260,7 +260,7 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 }
 
 // cleanupClientPool removes old unused clients from the pool
-func cleanupClientPool(maxAge time.Duration) {
+func CleanupClientPool(maxAge time.Duration) {
 	advancedClientPoolMutex.Lock()
 	defer advancedClientPoolMutex.Unlock()
 
