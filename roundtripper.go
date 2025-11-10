@@ -26,6 +26,8 @@ var globalClientSessionCache = utls.NewLRUClientSessionCache(16384)
 type roundTripper struct {
 	sync.Mutex
 
+	TotalRequests int64
+
 	// TLS fingerprinting options
 	PaddingExtension         *utls.UtlsPaddingExtension
 	EnableClientSessionCache bool
@@ -164,6 +166,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Perform the request
+	rt.TotalRequests++
 	return cached.RoundTrip(req)
 }
 

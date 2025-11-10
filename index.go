@@ -95,6 +95,7 @@ type Options struct {
 	EnableConnectionReuse bool `json:"enableConnectionReuse"` // Enable connection reuse across requests (default: true)
 
 	Meta                string `json:"meta"`                // Arbitrary metadata for client connection pooling
+	MaxTotalRequests    int64  `json:"maxTotalRequests"`    // Maximum total requests per connection (default: unlimited)
 	MaxResponseBodySize int64  `json:"maxResponseBodySize"` // Maximum response body size in bytes (default: unlimited)
 }
 
@@ -1427,13 +1428,6 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	}
 	defer resp.Body.Close()
 
-	if !enableConnectionReuse {
-		// Use type assertion to access the roundTripper
-		if transport, ok := httpClient.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections() // Close all idle connections
-		}
-	}
-
 	var bodyBytes []byte
 	if options.MaxResponseBodySize < 0 {
 		// Read body
@@ -1490,6 +1484,14 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 			Unparsed:   cookie.Unparsed,
 		}
 		netCookies = append(netCookies, netCookie)
+	}
+
+	if transport, ok := httpClient.Transport.(*roundTripper); ok {
+		if !enableConnectionReuse || transport.TotalRequests > options.MaxTotalRequests {
+			// Use type assertion to access the roundTripper
+			transport.TotalRequests = 0
+			transport.CloseIdleConnections() // Close all idle connections
+		}
 	}
 
 	return Response{
