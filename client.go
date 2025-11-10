@@ -168,9 +168,17 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 	}
 
 	// Create a hash of the configuration that affects connection behavior
-	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s|meta:%s",
-		browser.JA3,
-		browser.JA4r,
+	ja3 := browser.JA3
+	ja4r := browser.JA4r
+
+	if len(meta) > 0 {
+		ja3 = meta
+		ja4r = meta
+	}
+
+	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
+		ja3,
+		ja4r,
 		browser.HTTP2Fingerprint,
 		browser.QUICFingerprint,
 		browser.UserAgent,
@@ -181,7 +189,6 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 		browser.ForceHTTP1,
 		browser.ForceHTTP3,
 		cookieStr,
-		meta,
 	)
 
 	// Generate SHA256 hash for the key
