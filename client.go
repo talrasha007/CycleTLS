@@ -174,6 +174,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 	if len(meta) > 0 {
 		ja3 = meta
 		ja4r = meta
+		proxyURL = meta
 	}
 
 	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
