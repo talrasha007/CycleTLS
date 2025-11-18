@@ -565,6 +565,7 @@ func (rt *roundTripper) CloseIdleConnections(selectedAddr ...string) {
 			if connAddr != addr {
 				_ = conn.Close()
 				delete(rt.cachedConnections, connAddr)
+				delete(rt.cachedTransports, connAddr)
 			}
 		}
 	} else {
@@ -572,6 +573,7 @@ func (rt *roundTripper) CloseIdleConnections(selectedAddr ...string) {
 		for addr, conn := range rt.cachedConnections {
 			_ = conn.Close()
 			delete(rt.cachedConnections, addr)
+			delete(rt.cachedTransports, addr)
 		}
 	}
 }
