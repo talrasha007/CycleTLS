@@ -23,7 +23,7 @@ var (
 
 // ClientPoolEntry represents a cached client with metadata
 type ClientPoolEntry struct {
-	Client    fhttp.Client
+	Clients   []fhttp.Client
 	CreatedAt time.Time
 	LastUsed  time.Time
 }
@@ -211,38 +211,24 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxy)
 
 	// Try to get existing client from pool
-	advancedClientPoolMutex.RLock()
+	advancedClientPoolMutex.Lock()
+	defer advancedClientPoolMutex.Unlock()
 	if entry, exists := advancedClientPool[clientKey]; exists {
 		// Update last used time
 		entry.LastUsed = time.Now()
-		client := entry.Client
-		advancedClientPoolMutex.RUnlock()
-		return client, nil
-	}
-	advancedClientPoolMutex.RUnlock()
-
-	// Create new client if not found in pool
-	advancedClientPoolMutex.Lock()
-	defer advancedClientPoolMutex.Unlock()
-
-	// Double-check in case another goroutine created it while we were waiting for the write lock
-	if entry, exists := advancedClientPool[clientKey]; exists {
-		entry.LastUsed = time.Now()
-		return entry.Client, nil
+		if len(entry.Clients) > 0 {
+			// Return the first available client
+			client := entry.Clients[0]
+			// Remove the returned client from the pool
+			entry.Clients = entry.Clients[1:]
+			return client, nil
+		}
 	}
 
 	// Create new client
 	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
 	if err != nil {
 		return fhttp.Client{}, err
-	}
-
-	// Add to pool
-	now := time.Now()
-	advancedClientPool[clientKey] = &ClientPoolEntry{
-		Client:    client,
-		CreatedAt: now,
-		LastUsed:  now,
 	}
 
 	return client, nil
@@ -275,8 +261,10 @@ func CleanupClientPool(maxAge time.Duration) {
 	now := time.Now()
 	for key, entry := range advancedClientPool {
 		if now.Sub(entry.LastUsed) > maxAge {
-			if transport, ok := entry.Client.Transport.(*roundTripper); ok {
-				transport.CloseIdleConnections()
+			for _, client := range entry.Clients {
+				if transport, ok := client.Transport.(*roundTripper); ok {
+					transport.CloseIdleConnections()
+				}
 			}
 			delete(advancedClientPool, key)
 		}
@@ -290,8 +278,10 @@ func clearAllConnections() {
 
 	// Close all connections in the pool before clearing
 	for _, entry := range advancedClientPool {
-		if transport, ok := entry.Client.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections()
+		for _, client := range entry.Clients {
+			if transport, ok := client.Transport.(*roundTripper); ok {
+				transport.CloseIdleConnections()
+			}
 		}
 	}
 
@@ -299,15 +289,35 @@ func clearAllConnections() {
 	advancedClientPool = make(map[string]*ClientPoolEntry)
 }
 
-// newClient creates a new http client (backward compatibility - defaults to no connection reuse)
-func newClient(browser Browser, timeout int, disableRedirect bool, UserAgent string, meta string, proxyURL ...string) (fhttp.Client, error) {
-	// Backward compatibility: default to no connection reuse for existing code
-	return getOrCreateClient(browser, timeout, disableRedirect, UserAgent, false, meta, proxyURL...)
-}
-
 // newClientWithReuse creates a new http client with configurable connection reuse
 func newClientWithReuse(browser Browser, timeout int, disableRedirect bool, UserAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
 	return getOrCreateClient(browser, timeout, disableRedirect, UserAgent, enableConnectionReuse, meta, proxyURL...)
+}
+
+func pushBackClientToPool(maxIdle int, client fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string) {
+	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxyURL)
+
+	advancedClientPoolMutex.Lock()
+	defer advancedClientPoolMutex.Unlock()
+
+	entry, exists := advancedClientPool[clientKey]
+	if !exists {
+		entry = &ClientPoolEntry{
+			Clients:   []fhttp.Client{},
+			CreatedAt: time.Now(),
+			LastUsed:  time.Now(),
+		}
+		advancedClientPool[clientKey] = entry
+	}
+
+	if len(entry.Clients) < maxIdle {
+		entry.Clients = append(entry.Clients, client)
+		entry.LastUsed = time.Now()
+	} else {
+		if transport, ok := client.Transport.(*roundTripper); ok {
+			transport.CloseIdleConnections()
+		}
+	}
 }
 
 // WebSocketConnect establishes a WebSocket connection

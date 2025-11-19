@@ -24,7 +24,8 @@ func TestSomething(t *testing.T) {
 			// Chrome 140
 			Meta:                  "ignore_ja3",
 			EnableConnectionReuse: true,
-			MaxTotalRequests:      1,
+			MaxIdleClients:        128,
+			MaxTotalRequests:      2,
 			MaxResponseBodySize:   -1,
 			SignatureAlgorithms:   "0403,0804,0401,0503,0805,0501,0806,0601",
 			Ja3:                   "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,51-27-35-65037-17613-23-5-0-10-13-11-43-45-16-65281-18-41,29-23-24-25,0",

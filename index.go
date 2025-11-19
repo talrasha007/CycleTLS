@@ -92,6 +92,7 @@ type Options struct {
 	TLS13AutoRetry bool `json:"tls13AutoRetry"` // Automatically retry with TLS 1.3 compatible curves (default: true)
 
 	// Connection reuse options
+	MaxIdleClients        int  `json:"maxIdleClients"`        // Maximum idle connections per host (default: 512)
 	EnableConnectionReuse bool `json:"enableConnectionReuse"` // Enable connection reuse across requests (default: true)
 
 	Meta                string `json:"meta"`                // Arbitrary metadata for client connection pooling
@@ -1391,6 +1392,10 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		return Response{}, err
 	}
 
+	if enableConnectionReuse {
+		defer pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy)
+	}
+
 	// Create request using fhttp
 	var bodyReader io.Reader
 	if len(options.BodyBytes) > 0 {
@@ -1430,7 +1435,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	defer func() {
 		resp.Body.Close()
 		if transport, ok := httpClient.Transport.(*roundTripper); ok {
-			if !enableConnectionReuse || (options.MaxTotalRequests > 0 && transport.TotalRequests > options.MaxTotalRequests) {
+			if !enableConnectionReuse || (options.MaxTotalRequests > 0 && transport.TotalRequests >= options.MaxTotalRequests) {
 				// Use type assertion to access the roundTripper
 				transport.TotalRequests = 0
 				transport.CloseIdleConnections() // Close all idle connections
