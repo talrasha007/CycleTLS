@@ -1392,10 +1392,6 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		return Response{}, err
 	}
 
-	if enableConnectionReuse {
-		defer pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy)
-	}
-
 	// Create request using fhttp
 	var bodyReader io.Reader
 	if len(options.BodyBytes) > 0 {
@@ -1439,6 +1435,8 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 				// Use type assertion to access the roundTripper
 				transport.TotalRequests = 0
 				transport.CloseIdleConnections() // Close all idle connections
+			} else if enableConnectionReuse {
+				pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy)
 			}
 		}
 	}()
