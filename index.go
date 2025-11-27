@@ -177,6 +177,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 
 	client, err := newClientWithReuse(
 		browser,
+		0,
 		request.Options.Timeout,
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
@@ -327,6 +328,7 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 
 	client, err := newClientWithReuse(
 		browser,
+		0,
 		request.Options.Timeout,
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
@@ -413,6 +415,7 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 
 	client, err := newClientWithReuse(
 		browser,
+		0,
 		request.Options.Timeout,
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
@@ -1381,6 +1384,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 
 	httpClient, err := newClientWithReuse(
 		browser,
+		int(options.MaxTotalRequests),
 		options.Timeout,
 		options.DisableRedirect,
 		options.UserAgent,

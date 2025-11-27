@@ -197,7 +197,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 }
 
 // getOrCreateClient retrieves a client from the pool or creates a new one
-func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
+func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
 	// If connection reuse is disabled, always create a new client
 	if !enableConnectionReuse {
 		return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
@@ -216,19 +216,39 @@ func getOrCreateClient(browser Browser, timeout int, disableRedirect bool, userA
 	if entry, exists := advancedClientPool[clientKey]; exists {
 		// Update last used time
 		entry.LastUsed = time.Now()
-		if len(entry.Clients) > 0 {
-			// Return the first available client
-			client := entry.Clients[0]
-			// Remove the returned client from the pool
-			entry.Clients = entry.Clients[1:]
-			return client, nil
+
+		for i := 0; i < len(entry.Clients); i++ {
+			client := entry.Clients[i]
+			if transport, ok := client.Transport.(*roundTripper); ok {
+				if maxTotalReq > 0 && transport.TotalRequests < int64(maxTotalReq) {
+					if i > 0 {
+						entry.Clients = entry.Clients[i:]
+					}
+					return client, nil
+				} else if maxTotalReq <= 0 {
+					entry.Clients = entry.Clients[1:]
+					return client, nil
+				}
+			}
 		}
+
+		// No available client, fall through to create a new one
+		entry.Clients = []fhttp.Client{}
 	}
 
 	// Create new client
 	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
 	if err != nil {
 		return fhttp.Client{}, err
+	}
+
+	// Add new entry to pool
+	if maxTotalReq > 0 {
+		advancedClientPool[clientKey] = &ClientPoolEntry{
+			Clients:   []fhttp.Client{client},
+			CreatedAt: time.Now(),
+			LastUsed:  time.Now(),
+		}
 	}
 
 	return client, nil
@@ -292,8 +312,8 @@ func clearAllConnections() {
 }
 
 // newClientWithReuse creates a new http client with configurable connection reuse
-func newClientWithReuse(browser Browser, timeout int, disableRedirect bool, UserAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
-	return getOrCreateClient(browser, timeout, disableRedirect, UserAgent, enableConnectionReuse, meta, proxyURL...)
+func newClientWithReuse(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, UserAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
+	return getOrCreateClient(browser, maxTotalReq, timeout, disableRedirect, UserAgent, enableConnectionReuse, meta, proxyURL...)
 }
 
 func pushBackClientToPool(maxIdle int, client fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string) {
@@ -379,7 +399,7 @@ func (browser Browser) WebSocketConnect(ctx context.Context, urlStr string) (*we
 // SSEConnect establishes an SSE connection
 func (browser Browser) SSEConnect(ctx context.Context, urlStr string) (*SSEResponse, error) {
 	// Create HTTP client with connection reuse enabled
-	httpClient, err := newClientWithReuse(browser, 30, false, browser.UserAgent, true, "")
+	httpClient, err := newClientWithReuse(browser, 0, 30, false, browser.UserAgent, true, "")
 	if err != nil {
 		return nil, err
 	}
