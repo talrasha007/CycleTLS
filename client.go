@@ -332,6 +332,13 @@ func pushBackClientToPool(maxIdle int, client fhttp.Client, browser Browser, tim
 		advancedClientPool[clientKey] = entry
 	}
 
+	for i := 0; i < len(entry.Clients); i++ {
+		if entry.Clients[i].Transport == client.Transport {
+			// Client already in pool, no need to add
+			return
+		}
+	}
+
 	if len(entry.Clients) < maxIdle {
 		entry.Clients = append(entry.Clients, client)
 		entry.LastUsed = time.Now()
