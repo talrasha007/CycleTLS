@@ -49,6 +49,11 @@ type connectDialer struct {
 	cachedH2RawConn    net.Conn
 }
 
+var (
+	ProxyDialersMu sync.Mutex
+	ProxyDialers   = make(map[string]*proxy.ContextDialer)
+)
+
 // newConnectDialer creates a dialer to issue CONNECT requests and tunnel traffic via HTTP/S proxy.
 // proxyUrlStr must provide Scheme and Host, may provide credentials and port.
 // Example: https://username:password@golang.org:443
@@ -79,27 +84,37 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 			proxyURL.Host = net.JoinHostPort(proxyURL.Host, "443")
 		}
 	case "socks5", "socks5h":
-		var auth *proxy.Auth
-		if proxyURL.User != nil {
-			if proxyURL.User.Username() != "" {
-				username := proxyURL.User.Username()
-				password, _ := proxyURL.User.Password()
-				auth = &proxy.Auth{User: username, Password: password}
+		var contextDialer proxy.ContextDialer
+		ProxyDialersMu.Lock()
+		defer ProxyDialersMu.Unlock()
+
+		if cachedDialer, ok := ProxyDialers[proxyURLStr]; ok {
+			contextDialer = *cachedDialer
+		} else {
+			var auth *proxy.Auth
+			if proxyURL.User != nil {
+				if proxyURL.User.Username() != "" {
+					username := proxyURL.User.Username()
+					password, _ := proxyURL.User.Password()
+					auth = &proxy.Auth{User: username, Password: password}
+				}
+			}
+			var forward proxy.Dialer
+			if proxyURL.Scheme == "socks5h" {
+				forward = proxy.Direct
+			}
+			dialSocksProxy, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, forward)
+			if err != nil {
+				return nil, fmt.Errorf("Error creating SOCKS5 proxy, reason %s", err)
+			}
+			if cd, ok := dialSocksProxy.(proxy.ContextDialer); ok {
+				contextDialer = cd
+				ProxyDialers[proxyURLStr] = &contextDialer
+			} else {
+				return nil, errors.New("failed type assertion to DialContext")
 			}
 		}
-		var forward proxy.Dialer
-		if proxyURL.Scheme == "socks5h" {
-			forward = proxy.Direct
-		}
-		dialSocksProxy, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, forward)
-		if err != nil {
-			return nil, fmt.Errorf("Error creating SOCKS5 proxy, reason %s", err)
-		}
-		if contextDialer, ok := dialSocksProxy.(proxy.ContextDialer); ok {
-			client.Dialer = contextDialer
-		} else {
-			return nil, errors.New("failed type assertion to DialContext")
-		}
+		client.Dialer = contextDialer
 		client.DefaultHeader.Set("User-Agent", UserAgent)
 		return client, nil
 	case "socks4":
