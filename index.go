@@ -1435,12 +1435,11 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	defer func() {
 		resp.Body.Close()
 		if transport, ok := httpClient.Transport.(*roundTripper); ok {
-			if !enableConnectionReuse || (options.MaxTotalRequests > 0 && transport.TotalRequests >= options.MaxTotalRequests) {
-				// Use type assertion to access the roundTripper
+			if enableConnectionReuse && transport.TotalRequests < options.MaxTotalRequests && resp.StatusCode >= 200 && resp.StatusCode < 400 {
+				pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy)
+			} else {
 				transport.TotalRequests = 0
 				transport.CloseIdleConnections() // Close all idle connections
-			} else if enableConnectionReuse && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy)
 			}
 		}
 	}()
