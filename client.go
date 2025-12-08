@@ -226,9 +226,13 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 					if i > 0 {
 						entry.Clients = entry.Clients[i:]
 					}
+
+					transport.TotalRequests++
 					return client, nil
 				} else if maxTotalReq <= 0 {
 					entry.Clients = entry.Clients[1:]
+
+					transport.TotalRequests++
 					return client, nil
 				}
 			}

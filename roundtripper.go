@@ -166,7 +166,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Perform the request
-	rt.TotalRequests++
+	// rt.TotalRequests++
 	return cached.RoundTrip(req)
 }
 
