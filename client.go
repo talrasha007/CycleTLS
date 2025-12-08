@@ -236,6 +236,8 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 					return client, nil
 				}
 			}
+
+			entry.Clients[i] = fhttp.Client{}
 		}
 
 		// No available client, fall through to create a new one
