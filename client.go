@@ -168,10 +168,12 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 	}
 
 	// Create a hash of the configuration that affects connection behavior
+	ua := browser.UserAgent
 	ja3 := browser.JA3
 	ja4r := browser.JA4r
 
 	if len(meta) > 0 {
+		ua = meta
 		ja3 = meta
 		ja4r = meta
 	}
@@ -181,7 +183,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 		ja4r,
 		browser.HTTP2Fingerprint,
 		browser.QUICFingerprint,
-		browser.UserAgent,
+		ua,
 		proxyURL,
 		timeout,
 		disableRedirect,
