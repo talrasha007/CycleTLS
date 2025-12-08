@@ -222,7 +222,7 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 		for i := 0; i < len(entry.Clients); i++ {
 			client := entry.Clients[i]
 			if transport, ok := client.Transport.(*roundTripper); ok {
-				if maxTotalReq > 0 && transport.TotalRequests < int64(maxTotalReq) {
+				if maxTotalReq > 0 && transport.TotalRequests < int64(maxTotalReq)-1 {
 					if i > 0 {
 						entry.Clients = entry.Clients[i:]
 					}
