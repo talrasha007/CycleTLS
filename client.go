@@ -217,49 +217,19 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 	defer advancedClientPoolMutex.Unlock()
 	if entry, exists := advancedClientPool[clientKey]; exists {
 		// Update last used time
-		entry.LastUsed = time.Now()
+		if len(entry.Clients) > 0 {
+			entry.LastUsed = time.Now()
+			client := entry.Clients[0]
+			entry.Clients[0] = nil
+			entry.Clients = entry.Clients[1:]
 
-		for i := 0; i < len(entry.Clients); i++ {
-			client := entry.Clients[i]
-			if transport, ok := client.Transport.(*roundTripper); ok {
-				if maxTotalReq > 0 && transport.TotalRequests < int64(maxTotalReq)-1 {
-					if i > 0 {
-						entry.Clients = entry.Clients[i:]
-					}
-
-					transport.TotalRequests++
-					return client, nil
-				} else if maxTotalReq <= 0 {
-					entry.Clients = entry.Clients[1:]
-
-					transport.TotalRequests++
-					return client, nil
-				}
-			}
-
-			entry.Clients[i] = nil
+			client.Transport.(*roundTripper).TotalRequests++
+			return client, nil
 		}
-
-		// No available client, fall through to create a new one
-		entry.Clients = []*fhttp.Client{}
 	}
 
 	// Create new client
-	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Add new entry to pool
-	if maxTotalReq > 0 {
-		advancedClientPool[clientKey] = &ClientPoolEntry{
-			Clients:   []*fhttp.Client{client},
-			CreatedAt: time.Now(),
-			LastUsed:  time.Now(),
-		}
-	}
-
-	return client, nil
+	return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
 }
 
 // createNewClient creates a new HTTP client (internal function)
@@ -338,13 +308,6 @@ func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, ti
 			LastUsed:  time.Now(),
 		}
 		advancedClientPool[clientKey] = entry
-	}
-
-	for i := 0; i < len(entry.Clients); i++ {
-		if entry.Clients[i].Transport == client.Transport {
-			// Client already in pool, no need to add
-			return
-		}
 	}
 
 	if len(entry.Clients) < maxIdle {
