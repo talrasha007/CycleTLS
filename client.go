@@ -229,7 +229,9 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 	}
 
 	// Create new client
-	return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
+	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
+	client.Transport.(*roundTripper).TotalRequests++
+	return client, err
 }
 
 // createNewClient creates a new HTTP client (internal function)
