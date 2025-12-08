@@ -284,7 +284,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	activeRequests[request.RequestID] = cancel
 	activeRequestsMutex.Unlock()
 
-	return fullRequest{req: req, client: client, options: request}
+	return fullRequest{req: req, client: *client, options: request}
 }
 
 // dispatchHTTP3Request handles HTTP/3 specific request processing
@@ -371,7 +371,7 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	activeRequests[request.RequestID] = cancel
 	activeRequestsMutex.Unlock()
 
-	return fullRequest{req: req, client: client, options: request}
+	return fullRequest{req: req, client: *client, options: request}
 }
 
 // dispatchSSERequest handles SSE specific request processing
@@ -434,7 +434,7 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 	}
 
 	// Create SSE client
-	sseClient := NewSSEClient(&client, headers)
+	sseClient := NewSSEClient(client, headers)
 
 	// Create a placeholder request for consistency
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, request.Options.URL, nil)
@@ -448,7 +448,7 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 
 	return fullRequest{
 		req:       req,
-		client:    client,
+		client:    *client,
 		options:   request,
 		sseClient: sseClient,
 	}

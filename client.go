@@ -23,7 +23,7 @@ var (
 
 // ClientPoolEntry represents a cached client with metadata
 type ClientPoolEntry struct {
-	Clients   []fhttp.Client
+	Clients   []*fhttp.Client
 	CreatedAt time.Time
 	LastUsed  time.Time
 }
@@ -92,12 +92,12 @@ var disabledRedirect = func(req *fhttp.Request, via []*fhttp.Request) error {
 	return fhttp.ErrUseLastResponse
 }
 
-func clientBuilder(browser Browser, dialer proxy.ContextDialer, timeout int, disableRedirect bool) fhttp.Client {
+func clientBuilder(browser Browser, dialer proxy.ContextDialer, timeout int, disableRedirect bool) *fhttp.Client {
 	//if timeout is not set in call default to 15
 	if timeout == 0 {
 		timeout = 15
 	}
-	client := fhttp.Client{
+	client := &fhttp.Client{
 		Transport: newRoundTripper(browser, dialer),
 		Timeout:   time.Duration(timeout) * time.Second,
 	}
@@ -199,7 +199,7 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 }
 
 // getOrCreateClient retrieves a client from the pool or creates a new one
-func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
+func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (*fhttp.Client, error) {
 	// If connection reuse is disabled, always create a new client
 	if !enableConnectionReuse {
 		return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
@@ -237,23 +237,23 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 				}
 			}
 
-			entry.Clients[i] = fhttp.Client{}
+			entry.Clients[i] = nil
 		}
 
 		// No available client, fall through to create a new one
-		entry.Clients = []fhttp.Client{}
+		entry.Clients = []*fhttp.Client{}
 	}
 
 	// Create new client
 	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
 	if err != nil {
-		return fhttp.Client{}, err
+		return nil, err
 	}
 
 	// Add new entry to pool
 	if maxTotalReq > 0 {
 		advancedClientPool[clientKey] = &ClientPoolEntry{
-			Clients:   []fhttp.Client{client},
+			Clients:   []*fhttp.Client{client},
 			CreatedAt: time.Now(),
 			LastUsed:  time.Now(),
 		}
@@ -263,13 +263,13 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 }
 
 // createNewClient creates a new HTTP client (internal function)
-func createNewClient(browser Browser, timeout int, disableRedirect bool, userAgent string, proxyURL ...string) (fhttp.Client, error) {
+func createNewClient(browser Browser, timeout int, disableRedirect bool, userAgent string, proxyURL ...string) (*fhttp.Client, error) {
 	var dialer proxy.ContextDialer
 	if len(proxyURL) > 0 && len(proxyURL[0]) > 0 {
 		var err error
 		dialer, err = newConnectDialer(proxyURL[0], userAgent)
 		if err != nil {
-			return fhttp.Client{
+			return &fhttp.Client{
 				Timeout:       time.Duration(timeout) * time.Second,
 				CheckRedirect: disabledRedirect,
 			}, err
@@ -320,11 +320,11 @@ func clearAllConnections() {
 }
 
 // newClientWithReuse creates a new http client with configurable connection reuse
-func newClientWithReuse(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, UserAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (fhttp.Client, error) {
+func newClientWithReuse(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, UserAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (*fhttp.Client, error) {
 	return getOrCreateClient(browser, maxTotalReq, timeout, disableRedirect, UserAgent, enableConnectionReuse, meta, proxyURL...)
 }
 
-func pushBackClientToPool(maxIdle int, client fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string) {
+func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string) {
 	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxyURL)
 
 	advancedClientPoolMutex.Lock()
@@ -333,7 +333,7 @@ func pushBackClientToPool(maxIdle int, client fhttp.Client, browser Browser, tim
 	entry, exists := advancedClientPool[clientKey]
 	if !exists {
 		entry = &ClientPoolEntry{
-			Clients:   []fhttp.Client{},
+			Clients:   []*fhttp.Client{},
 			CreatedAt: time.Now(),
 			LastUsed:  time.Now(),
 		}
@@ -424,7 +424,7 @@ func (browser Browser) SSEConnect(ctx context.Context, urlStr string) (*SSERespo
 	headers.Set("User-Agent", browser.UserAgent)
 
 	// Create SSE client
-	sseClient := NewSSEClient(&httpClient, headers)
+	sseClient := NewSSEClient(httpClient, headers)
 
 	// Connect to SSE endpoint
 	return sseClient.Connect(ctx, urlStr)
