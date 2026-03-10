@@ -295,6 +295,7 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 
 		proxyConn, err := connectHTTP2(rawConn, h2clientConn)
 		if err != nil {
+			_ = h2clientConn.Close()
 			_ = rawConn.Close()
 			return nil, err
 		}
