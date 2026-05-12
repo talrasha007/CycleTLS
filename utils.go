@@ -133,7 +133,7 @@ func unBrotliData(data []byte) (resData []byte, err error) {
 }
 
 // StringToSpec creates a ClientHelloSpec based on a JA3 string
-func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (*utls.ClientHelloSpec, error) {
+func StringToSpec(ja3 string, forceTLS12 bool, userAgent string, forceHTTP1 bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (*utls.ClientHelloSpec, error) {
 	parsedUserAgent := parseUserAgent(userAgent)
 	// if tlsExtensions == nil {
 	// 	tlsExtensions = &TLSExtensions{}
@@ -227,7 +227,7 @@ func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgori
 	if err != nil {
 		return nil, err
 	}
-	tlsMaxVersion, tlsMinVersion, tlsExtension, err := createTlsVersion(uint16(ver), false)
+	tlsMaxVersion, tlsMinVersion, tlsExtension, err := createTlsVersion(uint16(ver), false, forceTLS12)
 	extMap["43"] = tlsExtension
 
 	// build extenions list
@@ -275,10 +275,10 @@ func StringToSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgori
 }
 
 // StringToTLS13CompatibleSpec creates a TLS 1.3 compatible ClientHelloSpec by filtering curves
-func StringToTLS13CompatibleSpec(ja3 string, userAgent string, forceHTTP1 bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (*utls.ClientHelloSpec, error) {
+func StringToTLS13CompatibleSpec(ja3 string, forceTLS12 bool, userAgent string, forceHTTP1 bool, signatureAlgorithms string, paddingExtension *utls.UtlsPaddingExtension) (*utls.ClientHelloSpec, error) {
 	// For TLS 1.3 compatibility, we use only widely supported curves: X25519 (29) and secp256r1 (23)
 	tls13CompatibleJA3 := convertJA3ForTLS13(ja3)
-	return StringToSpec(tls13CompatibleJA3, userAgent, forceHTTP1, signatureAlgorithms, paddingExtension)
+	return StringToSpec(tls13CompatibleJA3, forceTLS12, userAgent, forceHTTP1, signatureAlgorithms, paddingExtension)
 }
 
 // convertJA3ForTLS13 converts a JA3 string to use TLS 1.3 compatible curves
@@ -867,7 +867,7 @@ func PrettyStruct(data interface{}) (string, error) {
 }
 
 // TLSVersion，Ciphers，Extensions，EllipticCurves，EllipticCurvePointFormats
-func createTlsVersion(ver uint16, disableGrease bool) (tlsMaxVersion uint16, tlsMinVersion uint16, tlsSuppor utls.TLSExtension, err error) {
+func createTlsVersion(ver uint16, disableGrease bool, forceTLS12 bool) (tlsMaxVersion uint16, tlsMinVersion uint16, tlsSuppor utls.TLSExtension, err error) {
 	switch ver {
 	case utls.VersionTLS13:
 		tlsMaxVersion = utls.VersionTLS13
@@ -882,12 +882,19 @@ func createTlsVersion(ver uint16, disableGrease bool) (tlsMaxVersion uint16, tls
 		}
 	case utls.VersionTLS12:
 		tlsMaxVersion = utls.VersionTLS13
+		if forceTLS12 {
+			tlsMaxVersion = utls.VersionTLS12
+		}
 		tlsMinVersion = utls.VersionTLS12
 		versions := []uint16{}
 		if !disableGrease {
 			versions = append(versions, utls.GREASE_PLACEHOLDER)
 		}
-		versions = append(versions, utls.VersionTLS13, utls.VersionTLS12)
+		if forceTLS12 {
+			versions = append(versions, utls.VersionTLS12)
+		} else {
+			versions = append(versions, utls.VersionTLS13, utls.VersionTLS12)
+		}
 		tlsSuppor = &utls.SupportedVersionsExtension{
 			Versions: versions,
 		}
@@ -1102,7 +1109,7 @@ func QUICStringToSpec(quicFingerprint string, userAgent string, forceHTTP1 bool,
 	var tlsVersion uint16 = utls.VersionTLS13
 
 	// Create TLS configuration for QUIC
-	tlsMaxVersion, tlsMinVersion, tlsExtension, err := createTlsVersion(tlsVersion, false)
+	tlsMaxVersion, tlsMinVersion, tlsExtension, err := createTlsVersion(tlsVersion, false, false)
 	if err != nil {
 		return nil, err
 	}

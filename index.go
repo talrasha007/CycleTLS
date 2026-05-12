@@ -84,6 +84,7 @@ type Options struct {
 	InsecureSkipVerify bool     `json:"insecureSkipVerify"`
 
 	// Protocol options
+	ForceTLS12 bool   `json:"forceTLS12"`
 	ForceHTTP1 bool   `json:"forceHTTP1"`
 	ForceHTTP3 bool   `json:"forceHTTP3"`
 	Protocol   string `json:"protocol"` // "http1", "http2", "http3", "websocket", "sse"
@@ -145,6 +146,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		// Connection options
 		Cookies:            request.Options.Cookies,
 		InsecureSkipVerify: request.Options.InsecureSkipVerify,
+		ForceTLS12:         request.Options.ForceTLS12,
 		ForceHTTP1:         request.Options.ForceHTTP1,
 		ForceHTTP3:         request.Options.ForceHTTP3,
 
@@ -1395,6 +1397,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		UserAgent:                options.UserAgent,
 		Cookies:                  options.Cookies,
 		InsecureSkipVerify:       options.InsecureSkipVerify,
+		ForceTLS12:               options.ForceTLS12,
 		ForceHTTP1:               options.ForceHTTP1,
 		ForceHTTP3:               options.ForceHTTP3,
 		HeaderOrder:              options.HeaderOrder,

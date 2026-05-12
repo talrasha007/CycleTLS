@@ -52,6 +52,7 @@ type Browser struct {
 	// Connection options
 	Cookies            []Cookie
 	InsecureSkipVerify bool
+	ForceTLS12         bool
 	ForceHTTP1         bool
 	ForceHTTP3         bool
 

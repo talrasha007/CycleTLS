@@ -47,8 +47,10 @@ type roundTripper struct {
 	TLSConfig          *utls.Config
 	InsecureSkipVerify bool
 	Cookies            []Cookie
-	ForceHTTP1         bool
-	ForceHTTP3         bool
+
+	ForceTLS12 bool
+	ForceHTTP1 bool
+	ForceHTTP3 bool
 
 	// TLS 1.3 specific options
 	TLS13AutoRetry bool
@@ -253,11 +255,11 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 		// Check if we should proactively upgrade TLS 1.2 to TLS 1.3
 		if rt.TLS13AutoRetry && strings.HasPrefix(rt.JA3, "771,") {
 			// Use TLS 1.3 compatible spec to avoid retry cycle
-			spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
+			spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 			proactivelyUpgraded = true
 		} else {
 			// Use original JA3 fingerprint
-			spec, err = StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
+			spec, err = StringToSpec(rt.JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		}
 		if err != nil {
 			return nil, err
@@ -270,7 +272,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 		}
 	} else {
 		// Default to Chrome fingerprint
-		spec, err = StringToSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
+		spec, err = StringToSpec(DefaultChrome_JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, err
 		}
@@ -385,19 +387,19 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 		}
 	} else if rt.JA3 != "" {
 		// Use TLS 1.3 compatible JA3 spec
-		spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
+		spec, err = StringToTLS13CompatibleSpec(rt.JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible JA3 spec: %v", err)
 		}
 	} else if rt.JA4r != "" {
 		// For JA4r, we'll use a fallback to default Chrome with TLS 1.3 compatible curves
-		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
+		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible JA4 fallback spec: %v", err)
 		}
 	} else {
 		// Default to TLS 1.3 compatible Chrome fingerprint
-		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
+		spec, err = StringToTLS13CompatibleSpec(DefaultChrome_JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create TLS 1.3 compatible default spec: %v", err)
 		}
@@ -473,7 +475,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	}
 
 	// Use original TLS 1.2 JA3 spec (no upgrade)
-	spec, err := StringToSpec(rt.JA3, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
+	spec, err := StringToSpec(rt.JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create original TLS 1.2 JA3 spec: %v", err)
 	}
@@ -604,6 +606,7 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 		cachedTransports:         make(map[string]http.RoundTripper),
 		cachedConnections:        make(map[string]net.Conn),
 		InsecureSkipVerify:       browser.InsecureSkipVerify,
+		ForceTLS12:               browser.ForceTLS12,
 		ForceHTTP1:               browser.ForceHTTP1,
 		ForceHTTP3:               browser.ForceHTTP3,
 
