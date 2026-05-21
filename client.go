@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"net"
 	"sync"
 	"time"
 
@@ -93,13 +94,13 @@ var disabledRedirect = func(req *fhttp.Request, via []*fhttp.Request) error {
 	return fhttp.ErrUseLastResponse
 }
 
-func clientBuilder(browser Browser, dialer proxy.ContextDialer, timeout int, disableRedirect bool) *fhttp.Client {
+func clientBuilder(browser Browser, dialer proxy.ContextDialer, timeout int, disableRedirect bool, requestIP string) *fhttp.Client {
 	//if timeout is not set in call default to 15
 	if timeout == 0 {
 		timeout = 15
 	}
 	client := &fhttp.Client{
-		Transport: newRoundTripper(browser, dialer),
+		Transport: newRoundTripperWithIP(browser, dialer, requestIP),
 		Timeout:   time.Duration(timeout) * time.Second,
 	}
 	//if disableRedirect is set to true httpclient will not redirect
@@ -161,7 +162,7 @@ func NewTransportWithProxy(ja3 string, useragent string, proxy proxy.ContextDial
 }
 
 // generateClientKey creates a unique key for client pooling based on browser configuration
-func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string) string {
+func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP string) string {
 	// Create cookie signature for the key
 	cookieStr := ""
 	for _, cookie := range browser.Cookies {
@@ -179,13 +180,14 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 		ja4r = meta
 	}
 
-	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
+	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|ip:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
 		ja3,
 		ja4r,
 		browser.HTTP2Fingerprint,
 		browser.QUICFingerprint,
 		ua,
 		proxyURL,
+		requestIP,
 		timeout,
 		disableRedirect,
 		browser.InsecureSkipVerify,
@@ -201,17 +203,14 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 
 // getOrCreateClient retrieves a client from the pool or creates a new one
 func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (*fhttp.Client, error) {
+	proxy, requestIP := parseConnectionOptions(proxyURL...)
+
 	// If connection reuse is disabled, always create a new client
 	if !enableConnectionReuse {
-		return createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
+		return createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
 	}
 
-	proxy := ""
-	if len(proxyURL) > 0 {
-		proxy = proxyURL[0]
-	}
-
-	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxy)
+	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxy, requestIP)
 
 	// Try to get existing client from pool
 	advancedClientPoolMutex.Lock()
@@ -230,17 +229,18 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 	}
 
 	// Create new client
-	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxyURL...)
+	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
 	client.Transport.(*roundTripper).TotalRequests++
 	return client, err
 }
 
 // createNewClient creates a new HTTP client (internal function)
 func createNewClient(browser Browser, timeout int, disableRedirect bool, userAgent string, proxyURL ...string) (*fhttp.Client, error) {
+	proxyURLValue, requestIP := parseConnectionOptions(proxyURL...)
 	var dialer proxy.ContextDialer
-	if len(proxyURL) > 0 && len(proxyURL[0]) > 0 {
+	if proxyURLValue != "" {
 		var err error
-		dialer, err = newConnectDialer(proxyURL[0], userAgent)
+		dialer, err = newConnectDialer(proxyURLValue, userAgent)
 		if err != nil {
 			return &fhttp.Client{
 				Timeout:       time.Duration(timeout) * time.Second,
@@ -248,10 +248,13 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 			}, err
 		}
 	} else {
+		if requestIP != "" && net.ParseIP(requestIP) == nil {
+			return nil, fmt.Errorf("invalid request IP: %s", requestIP)
+		}
 		dialer = proxy.Direct
 	}
 
-	return clientBuilder(browser, dialer, timeout, disableRedirect), nil
+	return clientBuilder(browser, dialer, timeout, disableRedirect, requestIP), nil
 }
 
 // cleanupClientPool removes old unused clients from the pool
@@ -297,8 +300,9 @@ func newClientWithReuse(browser Browser, maxTotalReq int, timeout int, disableRe
 	return getOrCreateClient(browser, maxTotalReq, timeout, disableRedirect, UserAgent, enableConnectionReuse, meta, proxyURL...)
 }
 
-func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string) {
-	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxyURL)
+func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP ...string) {
+	_, requestIPValue := parseConnectionOptions(proxyURL, firstString(requestIP...))
+	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxyURL, requestIPValue)
 
 	advancedClientPoolMutex.Lock()
 	defer advancedClientPoolMutex.Unlock()
@@ -321,6 +325,23 @@ func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, ti
 			transport.CloseIdleConnections()
 		}
 	}
+}
+
+func parseConnectionOptions(values ...string) (proxyURL string, requestIP string) {
+	if len(values) > 0 {
+		proxyURL = values[0]
+	}
+	if len(values) > 1 && proxyURL == "" {
+		requestIP = values[1]
+	}
+	return proxyURL, requestIP
+}
+
+func firstString(values ...string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
 }
 
 // WebSocketConnect establishes a WebSocket connection

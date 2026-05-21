@@ -51,6 +51,7 @@ type roundTripper struct {
 	ForceTLS12 bool
 	ForceHTTP1 bool
 	ForceHTTP3 bool
+	RequestIP  string
 
 	// TLS 1.3 specific options
 	TLS13AutoRetry bool
@@ -178,7 +179,8 @@ func (rt *roundTripper) GetCached(req *http.Request, addr string) (http.RoundTri
 	rt.Lock()
 	defer rt.Unlock()
 
-	if cached, ok := rt.cachedTransports[addr]; ok {
+	cacheAddr := rt.getDialAddr(addr)
+	if cached, ok := rt.cachedTransports[cacheAddr]; ok {
 		return cached, nil
 	}
 
@@ -187,14 +189,14 @@ func (rt *roundTripper) GetCached(req *http.Request, addr string) (http.RoundTri
 	}
 
 	// Perform the request
-	return rt.cachedTransports[addr], nil
+	return rt.cachedTransports[cacheAddr], nil
 }
 
 func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 	switch strings.ToLower(req.URL.Scheme) {
 	case "http":
 		// Allow connection reuse by removing DisableKeepAlives
-		rt.cachedTransports[addr] = &http.Transport{
+		rt.cachedTransports[rt.getDialAddr(addr)] = &http.Transport{
 			DialContext: rt.dialContext,
 		}
 		return nil
@@ -226,13 +228,15 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 }
 
 func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (net.Conn, error) {
+	dialAddr := rt.getDialAddr(addr)
+
 	// Return cached connection if available
-	if conn := rt.cachedConnections[addr]; conn != nil {
+	if conn := rt.cachedConnections[dialAddr]; conn != nil {
 		return conn, nil
 	}
 
 	// Establish raw connection
-	rawConn, err := rt.dialer.DialContext(ctx, network, addr)
+	rawConn, err := rt.dialer.DialContext(ctx, network, dialAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +325,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 	}
 
 	// If transport already exists, return connection
-	if rt.cachedTransports[addr] != nil {
+	if rt.cachedTransports[dialAddr] != nil {
 		return conn, nil
 	}
 
@@ -356,25 +360,27 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 			}
 		}
 
-		rt.cachedTransports[addr] = &http2Transport
+		rt.cachedTransports[dialAddr] = &http2Transport
 	default:
 		// HTTP/1.x transport - configure to avoid idle channel errors
-		rt.cachedTransports[addr] = &http.Transport{
+		rt.cachedTransports[dialAddr] = &http.Transport{
 			DialTLSContext:    rt.dialTLS,
 			DisableKeepAlives: true, // Disable keep-alives to prevent idle channel errors
 		}
 	}
 
 	// Cache the connection for future use
-	rt.cachedConnections[addr] = conn
+	rt.cachedConnections[dialAddr] = conn
 
 	return nil, errProtocolNegotiated
 }
 
 // retryWithTLS13CompatibleCurves retries the TLS connection with TLS 1.3 compatible curves
 func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, network, addr, host string) (net.Conn, error) {
+	dialAddr := rt.getDialAddr(addr)
+
 	// Establish raw connection for retry
-	rawConn, err := rt.dialer.DialContext(ctx, network, addr)
+	rawConn, err := rt.dialer.DialContext(ctx, network, dialAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -455,25 +461,27 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 			}
 		}
 
-		rt.cachedTransports[addr] = &http2Transport
+		rt.cachedTransports[dialAddr] = &http2Transport
 	default:
 		// HTTP/1.x transport
-		rt.cachedTransports[addr] = &http.Transport{
+		rt.cachedTransports[dialAddr] = &http.Transport{
 			DialTLSContext:    rt.dialTLS,
 			DisableKeepAlives: true,
 		}
 	}
 
 	// Cache the successful TLS 1.3 connection
-	rt.cachedConnections[addr] = conn
+	rt.cachedConnections[dialAddr] = conn
 
 	return nil, errProtocolNegotiated
 }
 
 // retryWithOriginalTLS12JA3 retries the TLS connection with the original TLS 1.2 JA3
 func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, addr, host string) (net.Conn, error) {
+	dialAddr := rt.getDialAddr(addr)
+
 	// Establish raw connection for fallback to original TLS 1.2 JA3
-	rawConn, err := rt.dialer.DialContext(ctx, network, addr)
+	rawConn, err := rt.dialer.DialContext(ctx, network, dialAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -531,17 +539,17 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 			}
 		}
 
-		rt.cachedTransports[addr] = &http2Transport
+		rt.cachedTransports[dialAddr] = &http2Transport
 	default:
 		// HTTP/1.x transport
-		rt.cachedTransports[addr] = &http.Transport{
+		rt.cachedTransports[dialAddr] = &http.Transport{
 			DialTLSContext:    rt.dialTLS,
 			DisableKeepAlives: true,
 		}
 	}
 
 	// Cache the successful TLS 1.2 fallback connection
-	rt.cachedConnections[addr] = conn
+	rt.cachedConnections[dialAddr] = conn
 
 	return nil, errProtocolNegotiated
 }
@@ -551,7 +559,7 @@ func (rt *roundTripper) dialTLSHTTP2(network, addr string, _ *utls.Config) (net.
 }
 
 func (rt *roundTripper) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	conn, err := rt.dialer.DialContext(ctx, network, addr)
+	conn, err := rt.dialer.DialContext(ctx, network, rt.getDialAddr(addr))
 	if err != nil {
 		return nil, err
 	}
@@ -565,6 +573,18 @@ func (rt *roundTripper) getDialTLSAddr(req *http.Request) string {
 		return net.JoinHostPort(host, port)
 	}
 	return net.JoinHostPort(req.URL.Host, "443") // Default HTTPS port
+}
+
+func (rt *roundTripper) getDialAddr(addr string) string {
+	if rt.RequestIP == "" {
+		return addr
+	}
+
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return net.JoinHostPort(rt.RequestIP, port)
 }
 
 func (rt *roundTripper) recordResolvedIP(addr string, conn net.Conn) {
@@ -650,6 +670,10 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 		contextDialer = proxy.Direct
 	}
 
+	return newRoundTripperWithIP(browser, contextDialer, "")
+}
+
+func newRoundTripperWithIP(browser Browser, contextDialer proxy.ContextDialer, requestIP string) http.RoundTripper {
 	return &roundTripper{
 		dialer:                   contextDialer,
 		EnableClientSessionCache: browser.EnableClientSessionCache,
@@ -672,6 +696,7 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 		ForceTLS12:               browser.ForceTLS12,
 		ForceHTTP1:               browser.ForceHTTP1,
 		ForceHTTP3:               browser.ForceHTTP3,
+		RequestIP:                requestIP,
 
 		// TLS 1.3 specific options
 		TLS13AutoRetry: browser.TLS13AutoRetry,

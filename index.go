@@ -77,6 +77,7 @@ type Options struct {
 
 	// Connection options
 	Proxy              string   `json:"proxy"`
+	IP                 string   `json:"ip"` // Direct connection target IP for this request. Ignored when Proxy is set.
 	Cookies            []Cookie `json:"cookies"`
 	Timeout            int      `json:"timeout"`
 	DisableRedirect    bool     `json:"disableRedirect"`
@@ -187,6 +188,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		enableConnectionReuse,
 		"",
 		request.Options.Proxy,
+		request.Options.IP,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -338,6 +340,7 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 		enableConnectionReuse,
 		"",
 		request.Options.Proxy,
+		request.Options.IP,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -425,6 +428,7 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 		enableConnectionReuse,
 		"",
 		request.Options.Proxy,
+		request.Options.IP,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -1444,6 +1448,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		enableConnectionReuse,
 		options.Meta,
 		options.Proxy,
+		options.IP,
 	)
 	if err != nil {
 		return Response{}, err
@@ -1489,7 +1494,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		resp.Body.Close()
 		if transport, ok := httpClient.Transport.(*roundTripper); ok {
 			if enableConnectionReuse && transport.TotalRequests < options.MaxTotalRequests && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy)
+				pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy, options.IP)
 			} else {
 				transport.TotalRequests = 0
 				transport.CloseIdleConnections() // Close all idle connections

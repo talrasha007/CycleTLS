@@ -443,7 +443,9 @@ func (rt *roundTripper) ghttp3Dial(ctx context.Context, remoteAddr, port string,
 
 	// Resolve remote address
 	remoteHost := remoteAddr
-	if net.ParseIP(remoteAddr) == nil {
+	if rt.RequestIP != "" {
+		remoteHost = rt.RequestIP
+	} else if net.ParseIP(remoteAddr) == nil {
 		// If remoteAddr is not an IP, resolve it
 		ips, err := net.LookupIP(remoteAddr)
 		if err != nil {
@@ -526,7 +528,9 @@ func (rt *roundTripper) uhttp3Dial(ctx context.Context, spec *uquic.QUICSpec, re
 
 	// Resolve remote address
 	remoteHost := remoteAddr
-	if net.ParseIP(remoteAddr) == nil {
+	if rt.RequestIP != "" {
+		remoteHost = rt.RequestIP
+	} else if net.ParseIP(remoteAddr) == nil {
 		// If remoteAddr is not an IP, resolve it
 		ips, err := net.LookupIP(remoteAddr)
 		if err != nil {
