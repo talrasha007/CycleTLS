@@ -58,6 +58,8 @@ type roundTripper struct {
 	// Caching
 	cachedConnections map[string]net.Conn
 	cachedTransports  map[string]http.RoundTripper
+	resolvedIPs       map[string]string
+	resolvedIPsMu     sync.RWMutex
 
 	dialer proxy.ContextDialer
 }
@@ -193,7 +195,7 @@ func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 	case "http":
 		// Allow connection reuse by removing DisableKeepAlives
 		rt.cachedTransports[addr] = &http.Transport{
-			DialContext: rt.dialer.DialContext,
+			DialContext: rt.dialContext,
 		}
 		return nil
 	case "https":
@@ -234,6 +236,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 	if err != nil {
 		return nil, err
 	}
+	rt.recordResolvedIP(addr, rawConn)
 
 	// Extract host from address
 	var host string
@@ -375,6 +378,7 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	if err != nil {
 		return nil, err
 	}
+	rt.recordResolvedIP(addr, rawConn)
 
 	var spec *utls.ClientHelloSpec
 
@@ -473,6 +477,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	if err != nil {
 		return nil, err
 	}
+	rt.recordResolvedIP(addr, rawConn)
 
 	// Use original TLS 1.2 JA3 spec (no upgrade)
 	spec, err := StringToSpec(rt.JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
@@ -545,12 +550,69 @@ func (rt *roundTripper) dialTLSHTTP2(network, addr string, _ *utls.Config) (net.
 	return rt.dialTLS(context.Background(), network, addr)
 }
 
+func (rt *roundTripper) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	conn, err := rt.dialer.DialContext(ctx, network, addr)
+	if err != nil {
+		return nil, err
+	}
+	rt.recordResolvedIP(addr, conn)
+	return conn, nil
+}
+
 func (rt *roundTripper) getDialTLSAddr(req *http.Request) string {
 	host, port, err := net.SplitHostPort(req.URL.Host)
 	if err == nil {
 		return net.JoinHostPort(host, port)
 	}
 	return net.JoinHostPort(req.URL.Host, "443") // Default HTTPS port
+}
+
+func (rt *roundTripper) recordResolvedIP(addr string, conn net.Conn) {
+	if conn == nil || !rt.canRecordResolvedIP() {
+		return
+	}
+
+	remoteAddr := conn.RemoteAddr()
+	if remoteAddr == nil {
+		return
+	}
+
+	host, _, err := net.SplitHostPort(remoteAddr.String())
+	if err != nil {
+		host = remoteAddr.String()
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return
+	}
+
+	rt.setResolvedIP(addr, ip.String())
+}
+
+func (rt *roundTripper) setResolvedIP(addr, ip string) {
+	if addr == "" || ip == "" {
+		return
+	}
+
+	rt.resolvedIPsMu.Lock()
+	rt.resolvedIPs[addr] = ip
+	rt.resolvedIPsMu.Unlock()
+}
+
+func (rt *roundTripper) ResolvedIP(addr string) string {
+	rt.resolvedIPsMu.RLock()
+	defer rt.resolvedIPsMu.RUnlock()
+	return rt.resolvedIPs[addr]
+}
+
+func (rt *roundTripper) canRecordResolvedIP() bool {
+	switch rt.dialer.(type) {
+	case *connectDialer, *SocksDialer:
+		return false
+	default:
+		return true
+	}
 }
 
 // CloseIdleConnections closes connections that have been idle for too long
@@ -605,6 +667,7 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 		Cookies:                  browser.Cookies,
 		cachedTransports:         make(map[string]http.RoundTripper),
 		cachedConnections:        make(map[string]net.Conn),
+		resolvedIPs:              make(map[string]string),
 		InsecureSkipVerify:       browser.InsecureSkipVerify,
 		ForceTLS12:               browser.ForceTLS12,
 		ForceHTTP1:               browser.ForceHTTP1,

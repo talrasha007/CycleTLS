@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	nhttp "net/http"
 	"net/url"
 	"os"
@@ -1295,13 +1296,14 @@ func main() {
 
 // Backward compatibility types and functions for integration tests
 type Response struct {
-	RequestID string            `json:"requestId"`
-	Status    int               `json:"status"`
-	Body      string            `json:"body"`
-	BodyBytes []byte            `json:"bodyBytes"` // New field for binary response data
-	Headers   map[string]string `json:"headers"`
-	Cookies   []*nhttp.Cookie   `json:"cookies"`
-	FinalUrl  string            `json:"finalUrl"`
+	RequestID  string            `json:"requestId"`
+	Status     int               `json:"status"`
+	Body       string            `json:"body"`
+	BodyBytes  []byte            `json:"bodyBytes"` // New field for binary response data
+	Headers    map[string]string `json:"headers"`
+	Cookies    []*nhttp.Cookie   `json:"cookies"`
+	FinalUrl   string            `json:"finalUrl"`
+	ResolvedIP string            `json:"resolvedIp"`
 }
 
 // JSONBody parses the response body as JSON
@@ -1309,6 +1311,25 @@ func (r Response) JSONBody() map[string]interface{} {
 	var result map[string]interface{}
 	json.Unmarshal([]byte(r.Body), &result)
 	return result
+}
+
+func responseResolvedIPAddr(rawURL string) string {
+	parsedURL, err := url.Parse(rawURL)
+	if err != nil || parsedURL.Host == "" {
+		return ""
+	}
+
+	host, port, err := net.SplitHostPort(parsedURL.Host)
+	if err == nil {
+		return net.JoinHostPort(host, port)
+	}
+
+	switch parsedURL.Scheme {
+	case "http":
+		return net.JoinHostPort(parsedURL.Host, "80")
+	default:
+		return net.JoinHostPort(parsedURL.Host, "443")
+	}
 }
 
 // Init creates a simplified CycleTLS client for integration tests
@@ -1514,6 +1535,11 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		finalUrl = resp.Request.URL.String()
 	}
 
+	resolvedIP := ""
+	if transport, ok := httpClient.Transport.(*roundTripper); ok {
+		resolvedIP = transport.ResolvedIP(responseResolvedIPAddr(finalUrl))
+	}
+
 	// Convert fhttp cookies to net/http cookies
 	var netCookies []*nhttp.Cookie
 	for _, cookie := range resp.Cookies() {
@@ -1535,11 +1561,12 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	}
 
 	return Response{
-		Status:    resp.StatusCode,
-		Body:      string(bodyBytes),
-		BodyBytes: bodyBytes, // Provide raw bytes for binary data
-		Headers:   headers,
-		Cookies:   netCookies,
-		FinalUrl:  finalUrl,
+		Status:     resp.StatusCode,
+		Body:       string(bodyBytes),
+		BodyBytes:  bodyBytes, // Provide raw bytes for binary data
+		Headers:    headers,
+		Cookies:    netCookies,
+		FinalUrl:   finalUrl,
+		ResolvedIP: resolvedIP,
 	}, nil
 }

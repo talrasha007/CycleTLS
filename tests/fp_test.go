@@ -39,7 +39,8 @@ func TestSomething(t *testing.T) {
 			t.Fatal("Request Failed: " + err.Error())
 		}
 
+		fmt.Println("Response Status:", resp.Status)
+		fmt.Println("Server IP:", resp.ResolvedIP)
 		fmt.Println(resp.Body)
-
 	}
 }
