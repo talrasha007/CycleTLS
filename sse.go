@@ -215,6 +215,8 @@ func (r *SSEResponse) NextEvent() (*SSEEvent, error) {
 		return &event, nil
 	}
 
-	// No event data, return nil event and nil error
-	return nil, nil
+	// Scanner is exhausted with no pending data: the stream has ended.
+	// Returning io.EOF (instead of nil, nil) lets callers terminate their
+	// read loops instead of spinning forever on an empty stream.
+	return nil, io.EOF
 }

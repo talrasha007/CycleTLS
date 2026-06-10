@@ -16,12 +16,6 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// Global client pool for connection reuse
-var (
-	clientPool      = make(map[string]fhttp.Client)
-	clientPoolMutex = sync.RWMutex{}
-)
-
 // ClientPoolEntry represents a cached client with metadata
 type ClientPoolEntry struct {
 	Clients   []*fhttp.Client
@@ -230,8 +224,11 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 
 	// Create new client
 	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
+	if err != nil {
+		return client, err
+	}
 	client.Transport.(*roundTripper).TotalRequests++
-	return client, err
+	return client, nil
 }
 
 // createNewClient creates a new HTTP client (internal function)
@@ -300,7 +297,25 @@ func newClientWithReuse(browser Browser, maxTotalReq int, timeout int, disableRe
 	return getOrCreateClient(browser, maxTotalReq, timeout, disableRedirect, UserAgent, enableConnectionReuse, meta, proxyURL...)
 }
 
+// clientPoolJanitorOnce guards the lazy start of the background cleaner that
+// evicts idle pooled clients, keeping advancedClientPool bounded over time.
+var clientPoolJanitorOnce sync.Once
+
+func startClientPoolJanitor() {
+	clientPoolJanitorOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for range ticker.C {
+				CleanupClientPool(10 * time.Minute)
+			}
+		}()
+	})
+}
+
 func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP ...string) {
+	startClientPoolJanitor()
+
 	_, requestIPValue := parseConnectionOptions(proxyURL, firstString(requestIP...))
 	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxyURL, requestIPValue)
 

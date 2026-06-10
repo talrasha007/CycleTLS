@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
 	stdhttp "net/http"
+	"sync"
 	"time"
 
 	http "github.com/Danny-Dasilva/fhttp"
@@ -13,6 +15,32 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	uquic "github.com/refraction-networking/uquic"
 )
+
+// http3OwnedBody ties the lifetime of a per-request http3.Transport to the
+// response body. The transport owns the QUIC connection, UDP socket and
+// keep-alive goroutines, so it must be closed once the body is consumed.
+type http3OwnedBody struct {
+	io.ReadCloser
+	transport *http3.Transport
+	cancel    context.CancelFunc
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func newHTTP3OwnedBody(body io.ReadCloser, transport *http3.Transport, cancel context.CancelFunc) io.ReadCloser {
+	return &http3OwnedBody{ReadCloser: body, transport: transport, cancel: cancel}
+}
+
+func (b *http3OwnedBody) Close() error {
+	b.closeOnce.Do(func() {
+		b.closeErr = b.ReadCloser.Close()
+		if b.cancel != nil {
+			b.cancel()
+		}
+		_ = b.transport.Close()
+	})
+	return b.closeErr
+}
 
 // HTTP3Transport represents an HTTP/3 transport with customizable settings
 type HTTP3Transport struct {
@@ -109,16 +137,17 @@ func (t *UQuicHTTP3Transport) RoundTrip(req *http.Request) (*http.Response, erro
 	// requires more complex implementation that goes beyond the scope of this change.
 	// Future enhancement: Implement direct uquic HTTP/3 client integration
 
-	// Create standard HTTP/3 client as fallback
-	client := &stdhttp.Client{
-		Transport: &http3.Transport{
-			TLSClientConfig: t.TLSClientConfig,
-			QUICConfig: &quic.Config{
-				HandshakeIdleTimeout: 30 * time.Second,
-				MaxIdleTimeout:       90 * time.Second,
-				KeepAlivePeriod:      15 * time.Second,
-			},
+	// Create standard HTTP/3 transport as fallback
+	h3Transport := &http3.Transport{
+		TLSClientConfig: t.TLSClientConfig,
+		QUICConfig: &quic.Config{
+			HandshakeIdleTimeout: 30 * time.Second,
+			MaxIdleTimeout:       90 * time.Second,
+			KeepAlivePeriod:      15 * time.Second,
 		},
+	}
+	client := &stdhttp.Client{
+		Transport: h3Transport,
 	}
 
 	// Convert fhttp.Request to net/http.Request for HTTP/3
@@ -146,9 +175,9 @@ func (t *UQuicHTTP3Transport) RoundTrip(req *http.Request) (*http.Response, erro
 		Response:         nil,
 	}
 
-	// Create a context with timeout
+	// Create a context with timeout. The cancel func is tied to the response
+	// body: cancelling here would abort the stream before the caller reads it.
 	ctx, cancel := context.WithTimeout(req.Context(), t.DialTimeout)
-	defer cancel()
 
 	// Create a new request with the context
 	newReq := stdReq.Clone(ctx)
@@ -157,6 +186,8 @@ func (t *UQuicHTTP3Transport) RoundTrip(req *http.Request) (*http.Response, erro
 	// Uses standard HTTP/3 implementation (uquic integration available)
 	stdResp, err := client.Do(newReq)
 	if err != nil {
+		cancel()
+		_ = h3Transport.Close()
 		return nil, err
 	}
 
@@ -168,7 +199,7 @@ func (t *UQuicHTTP3Transport) RoundTrip(req *http.Request) (*http.Response, erro
 		ProtoMajor:       stdResp.ProtoMajor,
 		ProtoMinor:       stdResp.ProtoMinor,
 		Header:           ConvertHttpHeader(stdResp.Header),
-		Body:             stdResp.Body,
+		Body:             newHTTP3OwnedBody(stdResp.Body, h3Transport, cancel),
 		ContentLength:    stdResp.ContentLength,
 		TransferEncoding: stdResp.TransferEncoding,
 		Close:            stdResp.Close,
@@ -217,17 +248,18 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		Response:         nil,
 	}
 
-	// Create an HTTP/3 client
+	// Create an HTTP/3 transport for this request
+	h3Transport := &http3.Transport{
+		TLSClientConfig: t.TLSClientConfig,
+		QUICConfig:      t.QuicConfig,
+	}
 	client := &stdhttp.Client{
-		Transport: &http3.Transport{
-			TLSClientConfig: t.TLSClientConfig,
-			QUICConfig:      t.QuicConfig,
-		},
+		Transport: h3Transport,
 	}
 
-	// Create a context with timeout
+	// Create a context with timeout. The cancel func is tied to the response
+	// body: cancelling here would abort the stream before the caller reads it.
 	ctx, cancel := context.WithTimeout(req.Context(), t.DialTimeout)
-	defer cancel()
 
 	// Create a new request with the context
 	newReq := stdReq.Clone(ctx)
@@ -235,6 +267,8 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Perform the request
 	stdResp, err := client.Do(newReq)
 	if err != nil {
+		cancel()
+		_ = h3Transport.Close()
 		return nil, err
 	}
 
@@ -246,7 +280,7 @@ func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		ProtoMajor:       stdResp.ProtoMajor,
 		ProtoMinor:       stdResp.ProtoMinor,
 		Header:           ConvertHttpHeader(stdResp.Header),
-		Body:             stdResp.Body,
+		Body:             newHTTP3OwnedBody(stdResp.Body, h3Transport, cancel),
 		ContentLength:    stdResp.ContentLength,
 		TransferEncoding: stdResp.TransferEncoding,
 		Close:            stdResp.Close,

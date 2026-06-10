@@ -54,6 +54,10 @@ var (
 	ProxyDialers   = make(map[string]*proxy.ContextDialer)
 )
 
+// maxProxyDialers bounds the ProxyDialers cache. Per-session proxy URLs
+// (common with rotating residential proxies) would otherwise grow it forever.
+const maxProxyDialers = 1024
+
 // newConnectDialer creates a dialer to issue CONNECT requests and tunnel traffic via HTTP/S proxy.
 // proxyUrlStr must provide Scheme and Host, may provide credentials and port.
 // Example: https://username:password@golang.org:443
@@ -109,6 +113,10 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 			}
 			if cd, ok := dialSocksProxy.(proxy.ContextDialer); ok {
 				contextDialer = cd
+				if len(ProxyDialers) >= maxProxyDialers {
+					// Dialers hold no open resources, so dropping the cache is safe
+					ProxyDialers = make(map[string]*proxy.ContextDialer)
+				}
 				ProxyDialers[proxyURLStr] = &contextDialer
 			} else {
 				return nil, errors.New("failed type assertion to DialContext")

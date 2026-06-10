@@ -113,6 +113,7 @@ type fullRequest struct {
 	req       *http.Request
 	client    http.Client
 	options   cycleTLSRequest
+	browser   Browser          // Browser config used to build the client; needed to return it to the pool
 	sseClient *SSEClient       // For SSE connections
 	wsClient  *WebSocketClient // For WebSocket connections
 }
@@ -127,10 +128,19 @@ var activeRequests = make(map[string]context.CancelFunc)
 var activeRequestsMutex sync.Mutex
 var debugLogger = log.New(os.Stdout, "DEBUG: ", log.Ldate|log.Ltime|log.Lshortfile)
 
+// finishActiveRequest cancels the request context and removes it from the
+// active set so the context (and its resources) can be released.
+func finishActiveRequest(requestID string) {
+	activeRequestsMutex.Lock()
+	if cancel, exists := activeRequests[requestID]; exists {
+		cancel()
+		delete(activeRequests, requestID)
+	}
+	activeRequestsMutex.Unlock()
+}
+
 // ready Request
 func processRequest(request cycleTLSRequest) (result fullRequest) {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	var browser = Browser{
 		// TLS fingerprinting options
 		PaddingExtension:         request.Options.PaddingExtension,
@@ -171,6 +181,8 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 		// HTTP/3 requests are now supported
 		return dispatchHTTP3Request(request)
 	}
+
+	ctx, cancel := context.WithCancel(context.Background())
 
 	// Default to true for connection reuse
 	enableConnectionReuse := true
@@ -289,7 +301,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	activeRequests[request.RequestID] = cancel
 	activeRequestsMutex.Unlock()
 
-	return fullRequest{req: req, client: *client, options: request}
+	return fullRequest{req: req, client: *client, options: request, browser: browser}
 }
 
 // dispatchHTTP3Request handles HTTP/3 specific request processing
@@ -377,7 +389,7 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	activeRequests[request.RequestID] = cancel
 	activeRequestsMutex.Unlock()
 
-	return fullRequest{req: req, client: *client, options: request}
+	return fullRequest{req: req, client: *client, options: request, browser: browser}
 }
 
 // dispatchSSERequest handles SSE specific request processing
@@ -615,11 +627,7 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 		return
 	}
 
-	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
-	}()
+	defer finishActiveRequest(res.options.RequestID)
 
 	// Extract host from URL for connection reuse tracking
 	urlObj, _ := url.Parse(res.options.Options.URL)
@@ -632,12 +640,24 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 		}
 	}
 
-	// Don't close connections when finished - they'll be reused for the same host
-	// Instead, tell the roundtripper to keep this connection but close others
+	// On success, keep the connection for this host and return the client to
+	// the pool so it is actually reused. Otherwise close everything: a client
+	// that is neither pooled nor closed leaks its cached TLS connections.
+	keepAlive := false
 	defer func() {
-		// Use type assertion to access the roundTripper
-		if transport, ok := res.client.Transport.(*roundTripper); ok {
+		transport, ok := res.client.Transport.(*roundTripper)
+		if !ok {
+			return
+		}
+		if keepAlive && res.options.Options.EnableConnectionReuse {
 			transport.CloseIdleConnections(hostPort)
+			maxIdle := res.options.Options.MaxIdleClients
+			if maxIdle <= 0 {
+				maxIdle = 512
+			}
+			pushBackClientToPool(maxIdle, &res.client, res.browser, res.options.Options.Timeout, res.options.Options.DisableRedirect, "", res.options.Options.Proxy, res.options.Options.IP)
+		} else {
+			transport.CloseIdleConnections()
 		}
 	}()
 
@@ -772,6 +792,8 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 
 						chanWrite <- b.Bytes()
 					}
+					// Body fully consumed: connection is clean and safe to reuse
+					keepAlive = resp.StatusCode >= 200 && resp.StatusCode < 400
 					// EOF reached, exit the loop
 					break loop
 				}
@@ -819,10 +841,14 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 
 // dispatchSSEAsync handles SSE connections asynchronously
 func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
+	defer finishActiveRequest(res.options.RequestID)
+
+	// SSE clients are popped from the pool but never returned; close their
+	// cached connections when the stream ends so they don't leak.
 	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
+		if transport, ok := res.client.Transport.(*roundTripper); ok {
+			transport.CloseIdleConnections()
+		}
 	}()
 
 	// Connect to SSE endpoint
@@ -900,22 +926,24 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 		chanWrite <- b.Bytes()
 	}
 
-	// Read SSE events
+	// Read SSE events. The label is required: a bare break inside the select
+	// only exits the select and would spin in this loop forever.
+sseLoop:
 	for {
 		select {
 		case <-res.req.Context().Done():
 			debugLogger.Printf("SSE request %s was canceled", res.options.RequestID)
-			break
+			break sseLoop
 
 		default:
 			event, err := sseResp.NextEvent()
 			if err != nil {
 				if err == io.EOF {
 					// Normal end of stream
-					break
+					break sseLoop
 				}
 				debugLogger.Printf("SSE read error: %s", err.Error())
-				break
+				break sseLoop
 			}
 
 			if event == nil {
@@ -975,11 +1003,7 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 
 // dispatchWebSocketAsync handles WebSocket connections asynchronously
 func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
-	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
-	}()
+	defer finishActiveRequest(res.options.RequestID)
 
 	// Connect to WebSocket endpoint
 	conn, resp, err := res.wsClient.Connect(res.options.Options.URL)
@@ -1104,7 +1128,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		}
 	}
 
-	// Read WebSocket messages
+	// Read WebSocket messages. The label is required: a bare break inside the
+	// select only exits the select, not this loop.
+wsLoop:
 	for {
 		select {
 		case <-res.req.Context().Done():
@@ -1116,7 +1142,7 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 			if err != nil {
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 					// Normal close
-					break
+					break wsLoop
 				}
 				debugLogger.Printf("WebSocket read error: %s", err.Error())
 				return
@@ -1184,6 +1210,10 @@ func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn) {
 }
 
 func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
+	// Closing chanRead lets readProcess (and ultimately writeSocket via
+	// chanWrite) exit once the websocket client disconnects, instead of
+	// leaking those goroutines for every closed connection.
+	defer close(chanRead)
 	for {
 		_, message, err := wsSocket.ReadMessage()
 		if err != nil {
@@ -1228,9 +1258,18 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 
 // Worker
 func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
+	var inflight sync.WaitGroup
 	for request := range chanRead {
-		go dispatcherAsync(request, chanWrite)
+		inflight.Add(1)
+		go func(req fullRequest) {
+			defer inflight.Done()
+			dispatcherAsync(req, chanWrite)
+		}(request)
 	}
+	// chanRead is closed: wait for in-flight dispatchers (they still write to
+	// chanWrite), then close chanWrite so writeSocket terminates.
+	inflight.Wait()
+	close(chanWrite)
 }
 
 var upgrader = websocket.Upgrader{
@@ -1483,6 +1522,11 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	// Make request
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		// The client is not returned to the pool on failure, so close its
+		// cached connections instead of leaking them.
+		if transport, ok := httpClient.Transport.(*roundTripper); ok {
+			transport.CloseIdleConnections()
+		}
 		parsedError := parseError(err)
 		return Response{
 			Status: parsedError.StatusCode,

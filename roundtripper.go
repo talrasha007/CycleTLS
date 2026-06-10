@@ -648,6 +648,7 @@ func (rt *roundTripper) CloseIdleConnections(selectedAddr ...string) {
 		for connAddr, conn := range rt.cachedConnections {
 			if connAddr != addr {
 				_ = conn.Close()
+				rt.closeCachedTransport(connAddr)
 				delete(rt.cachedConnections, connAddr)
 				delete(rt.cachedTransports, connAddr)
 			}
@@ -656,9 +657,18 @@ func (rt *roundTripper) CloseIdleConnections(selectedAddr ...string) {
 		// No address specified, close all connections (original behavior)
 		for addr, conn := range rt.cachedConnections {
 			_ = conn.Close()
+			rt.closeCachedTransport(addr)
 			delete(rt.cachedConnections, addr)
 			delete(rt.cachedTransports, addr)
 		}
+	}
+}
+
+// closeCachedTransport releases connections held inside a cached transport's
+// own pool; dropping the map entry alone would strand them until GC.
+func (rt *roundTripper) closeCachedTransport(addr string) {
+	if t, ok := rt.cachedTransports[addr].(interface{ CloseIdleConnections() }); ok {
+		t.CloseIdleConnections()
 	}
 }
 
@@ -712,7 +722,7 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 	}
 
 	// Create HTTP/3 Transport - let it establish its own connections for now
-	roundTripper := &http3.Transport{
+	h3Transport := &http3.Transport{
 		TLSClientConfig: tlsConfig,
 		QUICConfig: &quic.Config{
 			HandshakeIdleTimeout:           30 * time.Second,
@@ -756,8 +766,9 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 	}
 
 	// Use the RoundTripper to make the request
-	stdResp, err := roundTripper.RoundTrip(stdReq)
+	stdResp, err := h3Transport.RoundTrip(stdReq)
 	if err != nil {
+		_ = h3Transport.Close()
 		return nil, err
 	}
 
@@ -769,7 +780,7 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 		ProtoMajor:       stdResp.ProtoMajor,
 		ProtoMinor:       stdResp.ProtoMinor,
 		Header:           ConvertHttpHeader(stdResp.Header),
-		Body:             stdResp.Body,
+		Body:             newHTTP3OwnedBody(stdResp.Body, h3Transport, nil),
 		ContentLength:    stdResp.ContentLength,
 		TransferEncoding: stdResp.TransferEncoding,
 		Close:            stdResp.Close,
