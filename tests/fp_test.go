@@ -23,7 +23,7 @@ func TestSomething(t *testing.T) {
 
 			// Chrome 140
 			Meta:                  "ignore_ja3",
-			EnableConnectionReuse: false,
+			EnableConnectionReuse: true,
 			MaxIdleClients:        128,
 			MaxTotalRequests:      2,
 			MaxResponseBodySize:   -1,
