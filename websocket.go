@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -108,21 +109,28 @@ type WebSocketResponse struct {
 
 	// Response is the HTTP response from the WebSocket handshake
 	Response *http.Response
+
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Close closes the WebSocket connection
 func (wsr *WebSocketResponse) Close() error {
-	if wsr.Conn != nil {
-		// Send close message
-		err := wsr.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		if err != nil {
-			return err
+	wsr.closeOnce.Do(func() {
+		if wsr.Conn == nil {
+			return
 		}
 
-		// Close the connection
-		return wsr.Conn.Close()
-	}
-	return nil
+		// Send close message
+		writeErr := wsr.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		closeErr := wsr.Conn.Close()
+		if writeErr != nil {
+			wsr.closeErr = writeErr
+			return
+		}
+		wsr.closeErr = closeErr
+	})
+	return wsr.closeErr
 }
 
 // Send sends a message over the WebSocket connection

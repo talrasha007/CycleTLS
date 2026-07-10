@@ -35,6 +35,8 @@ var (
 	advancedClientPoolMutex = sync.RWMutex{}
 )
 
+const defaultClientPoolMaxAge = 5 * time.Minute
+
 type Browser struct {
 	// TLS fingerprinting options
 	EnableClientSessionCache bool
@@ -209,6 +211,7 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 	if !enableConnectionReuse {
 		return createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
 	}
+	CleanupClientPool(defaultClientPoolMaxAge)
 
 	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxy, requestIP)
 
@@ -230,6 +233,9 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 
 	// Create new client
 	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
+	if err != nil {
+		return nil, err
+	}
 	client.Transport.(*roundTripper).TotalRequests++
 	return client, err
 }
@@ -259,20 +265,24 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 
 // cleanupClientPool removes old unused clients from the pool
 func CleanupClientPool(maxAge time.Duration) {
-	advancedClientPoolMutex.Lock()
-	defer advancedClientPoolMutex.Unlock()
+	if maxAge <= 0 {
+		maxAge = defaultClientPoolMaxAge
+	}
 
+	var expiredClients []*fhttp.Client
+	advancedClientPoolMutex.Lock()
 	now := time.Now()
 	for key, entry := range advancedClientPool {
 		if now.Sub(entry.LastUsed) > maxAge {
-			go func() {
-				for _, client := range entry.Clients {
-					if transport, ok := client.Transport.(*roundTripper); ok {
-						transport.CloseIdleConnections()
-					}
-				}
-			}()
+			expiredClients = append(expiredClients, entry.Clients...)
 			delete(advancedClientPool, key)
+		}
+	}
+	advancedClientPoolMutex.Unlock()
+
+	for _, client := range expiredClients {
+		if transport, ok := client.Transport.(*roundTripper); ok {
+			transport.CloseIdleConnections()
 		}
 	}
 }
@@ -301,6 +311,14 @@ func newClientWithReuse(browser Browser, maxTotalReq int, timeout int, disableRe
 }
 
 func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP ...string) {
+	if maxIdle <= 0 {
+		if transport, ok := client.Transport.(*roundTripper); ok {
+			transport.CloseIdleConnections()
+		}
+		return
+	}
+	CleanupClientPool(defaultClientPoolMaxAge)
+
 	_, requestIPValue := parseConnectionOptions(proxyURL, firstString(requestIP...))
 	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxyURL, requestIPValue)
 

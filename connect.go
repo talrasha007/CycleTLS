@@ -49,6 +49,23 @@ type connectDialer struct {
 	cachedH2RawConn    net.Conn
 }
 
+// CloseIdleConnections releases the cached HTTP/2 connection to the proxy.
+func (c *connectDialer) CloseIdleConnections() {
+	c.cacheH2Mu.Lock()
+	h2ClientConn := c.cachedH2ClientConn
+	rawConn := c.cachedH2RawConn
+	c.cachedH2ClientConn = nil
+	c.cachedH2RawConn = nil
+	c.cacheH2Mu.Unlock()
+
+	if h2ClientConn != nil {
+		_ = h2ClientConn.Close()
+	}
+	if rawConn != nil {
+		_ = rawConn.Close()
+	}
+}
+
 var (
 	ProxyDialersMu sync.Mutex
 	ProxyDialers   = make(map[string]*proxy.ContextDialer)
@@ -187,15 +204,18 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 
 		resp, err := h2clientConn.RoundTrip(req)
 		if err != nil {
+			_ = pw.CloseWithError(err)
 			_ = rawConn.Close()
 			return nil, err
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			_ = pw.Close()
+			_ = resp.Body.Close()
 			_ = rawConn.Close()
 			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status + "StatusCode:" + strconv.Itoa(resp.StatusCode))
 		}
-		return newHTTP2Conn(rawConn, pw, resp.Body), nil
+		return newHTTP2Conn(rawConn, pw, resp.Body, !c.EnableH2ConnReuse), nil
 	}
 
 	connectHTTP1 := func(rawConn net.Conn) (net.Conn, error) {
@@ -216,6 +236,7 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			_ = resp.Body.Close()
 			_ = rawConn.Close()
 			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status + " StatusCode:" + strconv.Itoa(resp.StatusCode))
 		}
@@ -270,6 +291,7 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 			}
 			err = tlsConn.Handshake()
 			if err != nil {
+				_ = tlsConn.Close()
 				return nil, err
 			}
 			negotiatedProtocol = tlsConn.ConnectionState().NegotiatedProtocol
@@ -313,14 +335,15 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 	}
 }
 
-func newHTTP2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadCloser) net.Conn {
-	return &http2Conn{Conn: c, in: pipedReqBody, out: respBody}
+func newHTTP2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadCloser, closeUnderlying bool) net.Conn {
+	return &http2Conn{Conn: c, in: pipedReqBody, out: respBody, closeUnderlying: closeUnderlying}
 }
 
 type http2Conn struct {
 	net.Conn
-	in  *io.PipeWriter
-	out io.ReadCloser
+	in              *io.PipeWriter
+	out             io.ReadCloser
+	closeUnderlying bool
 }
 
 func (h *http2Conn) Read(p []byte) (n int, err error) {
@@ -338,6 +361,11 @@ func (h *http2Conn) Close() error {
 	}
 	if err := h.out.Close(); err != nil {
 		retErr = err
+	}
+	if h.closeUnderlying {
+		if err := h.Conn.Close(); err != nil && retErr == nil {
+			retErr = err
+		}
 	}
 	return retErr
 }

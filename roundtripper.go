@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	stdhttp "net/http"
 	"strings"
@@ -22,6 +23,21 @@ import (
 
 var errProtocolNegotiated = errors.New("protocol negotiated")
 var globalClientSessionCache = utls.NewLRUClientSessionCache(16384)
+
+type closeTransportOnBodyClose struct {
+	io.ReadCloser
+	closeTransport func() error
+	once           sync.Once
+	closeErr       error
+}
+
+func (b *closeTransportOnBodyClose) Close() error {
+	bodyErr := b.ReadCloser.Close()
+	b.once.Do(func() {
+		b.closeErr = b.closeTransport()
+	})
+	return errors.Join(bodyErr, b.closeErr)
+}
 
 type roundTripper struct {
 	sync.Mutex
@@ -99,69 +115,10 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Get address for dialing
 	addr := rt.getDialTLSAddr(req)
 
-	// Check if we need HTTP/3 - matches reference implementation pattern
+	// HTTP/3 transports own QUIC sockets and must remain alive until the caller
+	// closes the response body. makeHTTP3Request binds that close to the body.
 	if rt.ForceHTTP3 {
-		// Extract host and port from request
-		host := req.URL.Hostname()
-		port := req.URL.Port()
-		if port == "" {
-			port = "443" // Default HTTPS port
-		}
-
-		// Check for USpec (matches reference implementation logic)
-		if rt.USpec != nil {
-			// Use UQuic-based HTTP/3 dialing
-			conn, err := rt.uhttp3Dial(req.Context(), rt.USpec, host, port)
-			if err != nil {
-				return nil, fmt.Errorf("uhttp3 dial failed: %w", err)
-			}
-			defer func() {
-				if conn.RawConn != nil {
-					conn.RawConn.Close()
-				}
-				// Close the QUIC connection based on its type
-				if conn.QuicConn != nil {
-					if conn.IsUQuic {
-						if uquicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-							uquicConn.CloseWithError(0, "request completed")
-						}
-					} else {
-						if quicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-							quicConn.CloseWithError(0, "request completed")
-						}
-					}
-				}
-			}()
-
-			// Use the HTTP/3 connection to make the request
-			return rt.makeHTTP3Request(req, conn)
-		}
-
-		// Fall back to standard HTTP/3 dialing
-		conn, err := rt.ghttp3Dial(req.Context(), host, port)
-		if err != nil {
-			return nil, fmt.Errorf("ghttp3 dial failed: %w", err)
-		}
-		defer func() {
-			if conn.RawConn != nil {
-				conn.RawConn.Close()
-			}
-			// Close the QUIC connection based on its type
-			if conn.QuicConn != nil {
-				if conn.IsUQuic {
-					if uquicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-						uquicConn.CloseWithError(0, "request completed")
-					}
-				} else {
-					if quicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-						quicConn.CloseWithError(0, "request completed")
-					}
-				}
-			}
-		}()
-
-		// Use the HTTP/3 connection to make the request
-		return rt.makeHTTP3Request(req, conn)
+		return rt.makeHTTP3Request(req)
 	}
 
 	// Use cached transport if available, otherwise create a new one
@@ -240,6 +197,12 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 	if err != nil {
 		return nil, err
 	}
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			_ = rawConn.Close()
+		}
+	}()
 	rt.recordResolvedIP(addr, rawConn)
 
 	// Extract host from address
@@ -326,6 +289,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 
 	// If transport already exists, return connection
 	if rt.cachedTransports[dialAddr] != nil {
+		keepConn = true
 		return conn, nil
 	}
 
@@ -371,6 +335,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 
 	// Cache the connection for future use
 	rt.cachedConnections[dialAddr] = conn
+	keepConn = true
 
 	return nil, errProtocolNegotiated
 }
@@ -384,6 +349,12 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	if err != nil {
 		return nil, err
 	}
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			_ = rawConn.Close()
+		}
+	}()
 	rt.recordResolvedIP(addr, rawConn)
 
 	var spec *utls.ClientHelloSpec
@@ -472,6 +443,7 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 
 	// Cache the successful TLS 1.3 connection
 	rt.cachedConnections[dialAddr] = conn
+	keepConn = true
 
 	return nil, errProtocolNegotiated
 }
@@ -485,6 +457,12 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	if err != nil {
 		return nil, err
 	}
+	keepConn := false
+	defer func() {
+		if !keepConn {
+			_ = rawConn.Close()
+		}
+	}()
 	rt.recordResolvedIP(addr, rawConn)
 
 	// Use original TLS 1.2 JA3 spec (no upgrade)
@@ -550,6 +528,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 
 	// Cache the successful TLS 1.2 fallback connection
 	rt.cachedConnections[dialAddr] = conn
+	keepConn = true
 
 	return nil, errProtocolNegotiated
 }
@@ -659,6 +638,10 @@ func (rt *roundTripper) CloseIdleConnections(selectedAddr ...string) {
 			delete(rt.cachedConnections, addr)
 			delete(rt.cachedTransports, addr)
 		}
+
+		if dialer, ok := rt.dialer.(interface{ CloseIdleConnections() }); ok {
+			dialer.CloseIdleConnections()
+		}
 	}
 }
 
@@ -703,15 +686,16 @@ func newRoundTripperWithIP(browser Browser, contextDialer proxy.ContextDialer, r
 	}
 }
 
-// makeHTTP3Request performs an HTTP/3 request using the provided HTTP/3 connection
-func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connection) (*http.Response, error) {
-	// Create HTTP/3 RoundTripper with custom dial function that uses our established connection
+// makeHTTP3Request performs an HTTP/3 request and ties transport cleanup to the response body.
+func (rt *roundTripper) makeHTTP3Request(req *http.Request) (*http.Response, error) {
 	tlsConfig := ConvertUtlsConfig(rt.TLSConfig)
 	if tlsConfig == nil {
 		tlsConfig = &tls.Config{}
+	} else {
+		tlsConfig = tlsConfig.Clone()
 	}
 
-	// Create HTTP/3 Transport - let it establish its own connections for now
+	// A transport is created per request, so it must be closed with the body.
 	roundTripper := &http3.Transport{
 		TLSClientConfig: tlsConfig,
 		QUICConfig: &quic.Config{
@@ -758,7 +742,12 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 	// Use the RoundTripper to make the request
 	stdResp, err := roundTripper.RoundTrip(stdReq)
 	if err != nil {
+		_ = roundTripper.Close()
 		return nil, err
+	}
+	stdResp.Body = &closeTransportOnBodyClose{
+		ReadCloser:     stdResp.Body,
+		closeTransport: roundTripper.Close,
 	}
 
 	// Convert back to fhttp.Response

@@ -113,6 +113,7 @@ type fullRequest struct {
 	req       *http.Request
 	client    http.Client
 	options   cycleTLSRequest
+	cancel    context.CancelFunc
 	sseClient *SSEClient       // For SSE connections
 	wsClient  *WebSocketClient // For WebSocket connections
 }
@@ -162,13 +163,16 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	// Handle protocol-specific clients
 	if request.Options.Protocol == "websocket" {
 		// WebSocket requests are handled separately
+		cancel()
 		return dispatchWebSocketRequest(request)
 	} else if request.Options.Protocol == "sse" {
 		// SSE requests are handled separately
+		cancel()
 		return dispatchSSERequest(request)
 	} else if request.Options.Protocol == "http3" || request.Options.ForceHTTP3 {
 		// HTTP/3 requests are handled separately and will be implemented later
 		// HTTP/3 requests are now supported
+		cancel()
 		return dispatchHTTP3Request(request)
 	}
 
@@ -289,7 +293,7 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	activeRequests[request.RequestID] = cancel
 	activeRequestsMutex.Unlock()
 
-	return fullRequest{req: req, client: *client, options: request}
+	return fullRequest{req: req, client: *client, options: request, cancel: cancel}
 }
 
 // dispatchHTTP3Request handles HTTP/3 specific request processing
@@ -377,7 +381,7 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 	activeRequests[request.RequestID] = cancel
 	activeRequestsMutex.Unlock()
 
-	return fullRequest{req: req, client: *client, options: request}
+	return fullRequest{req: req, client: *client, options: request, cancel: cancel}
 }
 
 // dispatchSSERequest handles SSE specific request processing
@@ -457,6 +461,7 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 		req:       req,
 		client:    *client,
 		options:   request,
+		cancel:    cancel,
 		sseClient: sseClient,
 	}
 }
@@ -522,6 +527,7 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 		req:      req,
 		client:   http.Client{}, // Empty client as WebSocket uses its own dialer
 		options:  request,
+		cancel:   cancel,
 		wsClient: wsClient,
 	}
 }
@@ -602,42 +608,47 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 // 	}
 // }
 
-func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
-	// Handle SSE connections
-	if res.sseClient != nil {
-		dispatchSSEAsync(res, chanWrite)
-		return
+func writeFrame(ctx context.Context, chanWrite chan<- []byte, frame []byte) bool {
+	select {
+	case chanWrite <- frame:
+		return true
+	case <-ctx.Done():
+		return false
 	}
+}
 
-	// Handle WebSocket connections
-	if res.wsClient != nil {
-		dispatchWebSocketAsync(res, chanWrite)
-		return
-	}
-
+func dispatcherAsync(res fullRequest, chanWrite chan []byte, sessionCtx context.Context) {
 	defer func() {
+		if res.cancel != nil {
+			res.cancel()
+		}
 		activeRequestsMutex.Lock()
 		delete(activeRequests, res.options.RequestID)
 		activeRequestsMutex.Unlock()
 	}()
 
-	// Extract host from URL for connection reuse tracking
-	urlObj, _ := url.Parse(res.options.Options.URL)
-	hostPort := urlObj.Host
-	if !strings.Contains(hostPort, ":") {
-		if urlObj.Scheme == "https" {
-			hostPort = hostPort + ":443" // Default HTTPS port
-		} else {
-			hostPort = hostPort + ":80" // Default HTTP port
-		}
+	if res.cancel != nil {
+		stopCancel := context.AfterFunc(sessionCtx, res.cancel)
+		defer stopCancel()
 	}
 
-	// Don't close connections when finished - they'll be reused for the same host
-	// Instead, tell the roundtripper to keep this connection but close others
+	// Handle SSE connections
+	if res.sseClient != nil {
+		dispatchSSEAsync(res, chanWrite, sessionCtx)
+		return
+	}
+
+	// Handle WebSocket connections
+	if res.wsClient != nil {
+		dispatchWebSocketAsync(res, chanWrite, sessionCtx)
+		return
+	}
+
+	// Requests handled by the WebSocket server are not returned to the client pool.
+	// Close their transport rather than retaining an unreachable cached connection.
 	defer func() {
-		// Use type assertion to access the roundTripper
 		if transport, ok := res.client.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections(hostPort)
+			transport.CloseIdleConnections()
 		}
 	}()
 
@@ -668,7 +679,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 			b.WriteByte(byte(messageLength))
 			b.WriteString(message)
 
-			chanWrite <- b.Bytes()
+			if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+				return
+			}
 		}
 
 		return
@@ -724,7 +737,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 			}
 		}
 
-		chanWrite <- b.Bytes()
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	{
@@ -770,7 +785,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 						b.WriteByte(byte(bodyChunkLength))
 						b.Write(chunkBuffer[:n])
 
-						chanWrite <- b.Bytes()
+						if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+							return
+						}
 					}
 					// EOF reached, exit the loop
 					break loop
@@ -797,7 +814,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 				b.WriteByte(byte(bodyChunkLength))
 				b.Write(chunkBuffer[:n])
 
-				chanWrite <- b.Bytes()
+				if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+					return
+				}
 			}
 		}
 	}
@@ -813,18 +832,14 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(3)
 		b.WriteString("end")
 
-		chanWrite <- b.Bytes()
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 	}
 }
 
 // dispatchSSEAsync handles SSE connections asynchronously
-func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
-	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
-	}()
-
+func dispatchSSEAsync(res fullRequest, chanWrite chan []byte, sessionCtx context.Context) {
 	// Connect to SSE endpoint
 	sseResp, err := res.sseClient.Connect(res.req.Context(), res.options.Options.URL)
 	if err != nil {
@@ -848,7 +863,9 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(byte(messageLength))
 		b.WriteString(message)
 
-		chanWrite <- b.Bytes()
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 		return
 	}
 	defer sseResp.Close()
@@ -897,25 +914,28 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 			}
 		}
 
-		chanWrite <- b.Bytes()
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	// Read SSE events
+readLoop:
 	for {
 		select {
 		case <-res.req.Context().Done():
 			debugLogger.Printf("SSE request %s was canceled", res.options.RequestID)
-			break
+			break readLoop
 
 		default:
 			event, err := sseResp.NextEvent()
 			if err != nil {
 				if err == io.EOF {
 					// Normal end of stream
-					break
+					break readLoop
 				}
 				debugLogger.Printf("SSE read error: %s", err.Error())
-				break
+				break readLoop
 			}
 
 			if event == nil {
@@ -953,7 +973,9 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 			b.WriteByte(byte(bodyChunkLength))
 			b.Write(eventBytes)
 
-			chanWrite <- b.Bytes()
+			if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+				return
+			}
 		}
 	}
 
@@ -969,18 +991,14 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(3)
 		b.WriteString("end")
 
-		chanWrite <- b.Bytes()
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 	}
 }
 
 // dispatchWebSocketAsync handles WebSocket connections asynchronously
-func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
-	defer func() {
-		activeRequestsMutex.Lock()
-		delete(activeRequests, res.options.RequestID)
-		activeRequestsMutex.Unlock()
-	}()
-
+func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte, sessionCtx context.Context) {
 	// Connect to WebSocket endpoint
 	conn, resp, err := res.wsClient.Connect(res.options.Options.URL)
 	if err != nil {
@@ -1010,7 +1028,12 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(byte(messageLength))
 		b.WriteString(message)
 
-		chanWrite <- b.Bytes()
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 		return
 	}
 
@@ -1019,6 +1042,8 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		Response: resp,
 	}
 	defer wsResp.Close()
+	stopClose := context.AfterFunc(sessionCtx, func() { _ = wsResp.Close() })
+	defer stopClose()
 
 	// Send initial response with headers
 	{
@@ -1064,7 +1089,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 			}
 		}
 
-		chanWrite <- b.Bytes()
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	// Send initial connection success message
@@ -1093,7 +1120,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(byte(bodyChunkLength))
 		b.Write(msgBytes)
 
-		chanWrite <- b.Bytes()
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	// If there's body data, send it as the first WebSocket message
@@ -1105,6 +1134,7 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 	}
 
 	// Read WebSocket messages
+readLoop:
 	for {
 		select {
 		case <-res.req.Context().Done():
@@ -1116,7 +1146,7 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 			if err != nil {
 				if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
 					// Normal close
-					break
+					break readLoop
 				}
 				debugLogger.Printf("WebSocket read error: %s", err.Error())
 				return
@@ -1152,7 +1182,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 			b.WriteByte(byte(bodyChunkLength))
 			b.Write(msgBytes)
 
-			chanWrite <- b.Bytes()
+			if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+				return
+			}
 		}
 	}
 
@@ -1168,23 +1200,37 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(3)
 		b.WriteString("end")
 
-		chanWrite <- b.Bytes()
-	}
-}
-
-func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn) {
-	for buf := range chanWrite {
-		err := wsSocket.WriteMessage(websocket.BinaryMessage, buf)
-
-		if err != nil {
-			log.Print("Socket WriteMessage Failed" + err.Error())
-			continue
+		if !writeFrame(sessionCtx, chanWrite, b.Bytes()) {
+			return
 		}
 	}
 }
 
-func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
+func writeSocket(chanWrite <-chan []byte, wsSocket *websocket.Conn, done <-chan struct{}) {
 	for {
+		select {
+		case <-done:
+			return
+		case buf, ok := <-chanWrite:
+			if !ok {
+				return
+			}
+			if err := wsSocket.WriteMessage(websocket.BinaryMessage, buf); err != nil {
+				log.Print("Socket WriteMessage Failed" + err.Error())
+				return
+			}
+		}
+	}
+}
+
+func readSocket(chanRead chan<- fullRequest, wsSocket *websocket.Conn, done <-chan struct{}) {
+	for {
+		select {
+		case <-done:
+			return
+		default:
+		}
+
 		_, message, err := wsSocket.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
@@ -1222,14 +1268,30 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 			log.Print("Unmarshal Error", err)
 			return
 		}
-		chanRead <- processRequest(*request)
+		fullRequest := processRequest(*request)
+		select {
+		case chanRead <- fullRequest:
+		case <-done:
+			if fullRequest.cancel != nil {
+				fullRequest.cancel()
+			}
+			return
+		}
 	}
 }
 
 // Worker
-func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
-	for request := range chanRead {
-		go dispatcherAsync(request, chanWrite)
+func readProcess(chanRead <-chan fullRequest, chanWrite chan []byte, sessionCtx context.Context) {
+	for {
+		select {
+		case <-sessionCtx.Done():
+			return
+		case request, ok := <-chanRead:
+			if !ok {
+				return
+			}
+			go dispatcherAsync(request, chanWrite, sessionCtx)
+		}
 	}
 }
 
@@ -1268,14 +1330,21 @@ func WSEndpoint(w nhttp.ResponseWriter, r *nhttp.Request) {
 		log.Println(body)
 
 	} else {
+		sessionCtx, cancelSession := context.WithCancel(r.Context())
+		defer cancelSession()
+		defer ws.Close()
+
 		chanRead := make(chan fullRequest)
 		chanWrite := make(chan []byte)
 
-		go readSocket(chanRead, ws)
-		go readProcess(chanRead, chanWrite)
+		go func() {
+			defer cancelSession()
+			readSocket(chanRead, ws, sessionCtx.Done())
+		}()
+		go readProcess(chanRead, chanWrite, sessionCtx)
 
 		// Run as main thread
-		writeSocket(chanWrite, ws)
+		writeSocket(chanWrite, ws, sessionCtx.Done())
 	}
 }
 
@@ -1493,8 +1562,13 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	defer func() {
 		resp.Body.Close()
 		if transport, ok := httpClient.Transport.(*roundTripper); ok {
-			if enableConnectionReuse && transport.TotalRequests < options.MaxTotalRequests && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy, options.IP)
+			maxIdleClients := options.MaxIdleClients
+			if maxIdleClients == 0 {
+				maxIdleClients = 512
+			}
+			withinRequestLimit := options.MaxTotalRequests <= 0 || transport.TotalRequests < options.MaxTotalRequests
+			if enableConnectionReuse && withinRequestLimit && resp.StatusCode >= 200 && resp.StatusCode < 400 {
+				pushBackClientToPool(maxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy, options.IP)
 			} else {
 				transport.TotalRequests = 0
 				transport.CloseIdleConnections() // Close all idle connections

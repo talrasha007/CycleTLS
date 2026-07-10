@@ -520,6 +520,7 @@ func (rt *roundTripper) uhttp3Dial(ctx context.Context, spec *uquic.QUICSpec, re
 
 	// Configure TLS with uTLS config - use utls.Config directly (matches reference implementation)
 	if rt.TLSConfig == nil {
+		_ = udpConn.Close()
 		return nil, fmt.Errorf("TLS config is required for UQuic HTTP/3")
 	}
 	tlsConfig := rt.TLSConfig.Clone()
