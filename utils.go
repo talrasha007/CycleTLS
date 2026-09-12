@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -229,6 +230,13 @@ func StringToSpec(ja3 string, forceTLS12 bool, userAgent string, forceHTTP1 bool
 	}
 	tlsMaxVersion, tlsMinVersion, tlsExtension, err := createTlsVersion(uint16(ver), false, forceTLS12)
 	extMap["43"] = tlsExtension
+
+	// Without supported_versions on the wire the server cannot pick TLS 1.3, so a
+	// 1.3 maximum here only arms the downgrade canary check in crypto/tls and
+	// turns an ordinary TLS 1.2 handshake into "downgrade attempt detected".
+	if tlsMaxVersion > utls.VersionTLS12 && !slices.Contains(extensions, "43") {
+		tlsMaxVersion = utls.VersionTLS12
+	}
 
 	// build extenions list
 	var exts []utls.TLSExtension
