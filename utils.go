@@ -257,7 +257,13 @@ func StringToSpec(ja3 string, forceTLS12 bool, userAgent string, forceHTTP1 bool
 	for _, e := range extensions {
 		te, ok := extMap[e]
 		if !ok {
-			return nil, raiseExtensionError(e)
+			// Unknown codepoint (e.g. 51764 trust_anchors): send it empty so the
+			// extension still lands in the fingerprint at the right position.
+			id, perr := strconv.ParseUint(e, 10, 16)
+			if perr != nil {
+				return nil, raiseExtensionError(e)
+			}
+			te = &utls.GenericExtension{Id: uint16(id)}
 		}
 		// //Optionally add Chrome Grease Extension
 		// if e == "21" && parsedUserAgent == chrome && !tlsExtensions.UseGREASE {
