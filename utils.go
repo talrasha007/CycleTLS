@@ -164,11 +164,6 @@ func StringToSpec(ja3 string, forceTLS12 bool, userAgent string, forceHTTP1 bool
 				supportedVersions.Versions = append([]uint16{utls.GREASE_PLACEHOLDER}, supportedVersions.Versions...)
 			}
 		}
-		if keyShareExt, ok := extMap["51"]; ok {
-			if keyShare, ok := keyShareExt.(*utls.KeyShareExtension); ok {
-				keyShare.KeyShares = append([]utls.KeyShare{{Group: utls.CurveID(utls.GREASE_PLACEHOLDER), Data: []byte{0}}}, keyShare.KeyShares...)
-			}
-		}
 	} else {
 		if keyShareExt, ok := extMap["51"]; ok {
 			if keyShare, ok := keyShareExt.(*utls.KeyShareExtension); ok {
@@ -204,6 +199,20 @@ func StringToSpec(ja3 string, forceTLS12 bool, userAgent string, forceHTTP1 bool
 	}
 
 	extMap["10"] = &utls.SupportedCurvesExtension{Curves: targetCurves}
+
+	// key_share must cover the preferred post-quantum group. Otherwise the server
+	// answers with a HelloRetryRequest selecting it, and uTLS cannot generate an
+	// MLKEM key in the HRR path ("tls: CurvePreferences includes unsupported curve").
+	pq := slices.IndexFunc(targetCurves, func(c utls.CurveID) bool {
+		return c == utls.X25519MLKEM768 || c == utls.X25519Kyber768Draft00
+	})
+	if ks, ok := extMap["51"].(*utls.KeyShareExtension); ok && pq >= 0 {
+		at := 0
+		if len(ks.KeyShares) > 0 && ks.KeyShares[0].Group == utls.CurveID(utls.GREASE_PLACEHOLDER) {
+			at = 1 // keep GREASE first
+		}
+		ks.KeyShares = slices.Insert(ks.KeyShares, at, utls.KeyShare{Group: targetCurves[pq]})
+	}
 
 	// parse point formats
 	var targetPointFormats []byte
