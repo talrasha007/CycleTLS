@@ -1,6 +1,8 @@
 package cycletls
 
 import (
+	"context"
+	"errors"
 	utls "github.com/refraction-networking/utls"
 	"net"
 	"net/http"
@@ -64,6 +66,11 @@ func NewWebSocketClient(tlsConfig *utls.Config, headers http.Header) *WebSocketC
 
 // Connect establishes a WebSocket connection
 func (wsc *WebSocketClient) Connect(urlStr string) (*websocket.Conn, *http.Response, error) {
+	return wsc.ConnectContext(context.Background(), urlStr)
+}
+
+// ConnectContext applies cancellation to the opening handshake.
+func (wsc *WebSocketClient) ConnectContext(ctx context.Context, urlStr string) (*websocket.Conn, *http.Response, error) {
 	// Parse the URL
 	u, err := url.Parse(urlStr)
 	if err != nil {
@@ -92,8 +99,41 @@ func (wsc *WebSocketClient) Connect(urlStr string) (*websocket.Conn, *http.Respo
 		RawQuery: u.RawQuery,
 	}
 
-	// Connect to the WebSocket server
-	conn, resp, err := wsc.Dialer.Dial(wsURL.String(), wsc.Headers)
+	// Gorilla applies Context to dialing, but the HTTP upgrade itself uses
+	// blocking I/O. Close that socket on cancellation until the upgrade ends.
+	dialer := *wsc.Dialer
+	stop := func() bool { return true }
+	defer func() { stop() }()
+	watchDial := func(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+		return func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dial(dialCtx, network, addr)
+			if err == nil {
+				stop = context.AfterFunc(ctx, func() { _ = conn.Close() })
+			}
+			return conn, err
+		}
+	}
+	dial := dialer.NetDialContext
+	if dial == nil {
+		if dialer.NetDial != nil {
+			dial = func(_ context.Context, network, addr string) (net.Conn, error) {
+				return wsc.Dialer.NetDial(network, addr)
+			}
+		} else {
+			dial = (&net.Dialer{}).DialContext
+		}
+	}
+	dialer.NetDialContext = watchDial(dial)
+	if dialer.NetDialTLSContext != nil {
+		dialer.NetDialTLSContext = watchDial(dialer.NetDialTLSContext)
+	}
+	conn, resp, err := dialer.DialContext(ctx, wsURL.String(), wsc.Headers)
+	if !stop() || ctx.Err() != nil {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		return nil, resp, ctx.Err()
+	}
 	if err != nil {
 		return nil, resp, err
 	}
@@ -114,13 +154,8 @@ type WebSocketResponse struct {
 func (wsr *WebSocketResponse) Close() error {
 	if wsr.Conn != nil {
 		// Send close message
-		err := wsr.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		if err != nil {
-			return err
-		}
-
-		// Close the connection
-		return wsr.Conn.Close()
+		err := wsr.Conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(time.Second))
+		return errors.Join(err, wsr.Conn.Close())
 	}
 	return nil
 }

@@ -140,7 +140,7 @@ func finishActiveRequest(requestID string) {
 }
 
 // ready Request
-func processRequest(request cycleTLSRequest) (result fullRequest) {
+func processRequest(request cycleTLSRequest, parents ...context.Context) (result fullRequest) {
 	var browser = Browser{
 		// TLS fingerprinting options
 		PaddingExtension:         request.Options.PaddingExtension,
@@ -172,17 +172,17 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 	// Handle protocol-specific clients
 	if request.Options.Protocol == "websocket" {
 		// WebSocket requests are handled separately
-		return dispatchWebSocketRequest(request)
+		return dispatchWebSocketRequest(request, parents...)
 	} else if request.Options.Protocol == "sse" {
 		// SSE requests are handled separately
-		return dispatchSSERequest(request)
+		return dispatchSSERequest(request, parents...)
 	} else if request.Options.Protocol == "http3" || request.Options.ForceHTTP3 {
 		// HTTP/3 requests are handled separately and will be implemented later
 		// HTTP/3 requests are now supported
-		return dispatchHTTP3Request(request)
+		return dispatchHTTP3Request(request, parents...)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(requestParent(parents))
 
 	// Default to true for connection reuse
 	enableConnectionReuse := true
@@ -305,8 +305,8 @@ func processRequest(request cycleTLSRequest) (result fullRequest) {
 }
 
 // dispatchHTTP3Request handles HTTP/3 specific request processing
-func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
-	ctx, cancel := context.WithCancel(context.Background())
+func dispatchHTTP3Request(request cycleTLSRequest, parents ...context.Context) (result fullRequest) {
+	ctx, cancel := context.WithCancel(requestParent(parents))
 
 	// Create browser configuration for HTTP/3
 	var browser = Browser{
@@ -393,8 +393,8 @@ func dispatchHTTP3Request(request cycleTLSRequest) (result fullRequest) {
 }
 
 // dispatchSSERequest handles SSE specific request processing
-func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
-	ctx, cancel := context.WithCancel(context.Background())
+func dispatchSSERequest(request cycleTLSRequest, parents ...context.Context) (result fullRequest) {
+	ctx, cancel := context.WithCancel(requestParent(parents))
 
 	// Create browser configuration for SSE
 	var browser = Browser{
@@ -474,8 +474,8 @@ func dispatchSSERequest(request cycleTLSRequest) (result fullRequest) {
 }
 
 // dispatchWebSocketRequest handles WebSocket specific request processing
-func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
-	ctx, cancel := context.WithCancel(context.Background())
+func dispatchWebSocketRequest(request cycleTLSRequest, parents ...context.Context) (result fullRequest) {
+	ctx, cancel := context.WithCancel(requestParent(parents))
 
 	// Create browser configuration for WebSocket
 	var browser = Browser{
@@ -614,6 +614,22 @@ func dispatchWebSocketRequest(request cycleTLSRequest) (result fullRequest) {
 // 	}
 // }
 
+func requestParent(parents []context.Context) context.Context {
+	if len(parents) > 0 {
+		return parents[0]
+	}
+	return context.Background()
+}
+
+func sendResponse(ctx context.Context, out chan<- []byte, data []byte) bool {
+	select {
+	case out <- data:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 	// Handle SSE connections
 	if res.sseClient != nil {
@@ -630,15 +646,7 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 	defer finishActiveRequest(res.options.RequestID)
 
 	// Extract host from URL for connection reuse tracking
-	urlObj, _ := url.Parse(res.options.Options.URL)
-	hostPort := urlObj.Host
-	if !strings.Contains(hostPort, ":") {
-		if urlObj.Scheme == "https" {
-			hostPort = hostPort + ":443" // Default HTTPS port
-		} else {
-			hostPort = hostPort + ":80" // Default HTTP port
-		}
-	}
+	hostPort := responseResolvedIPAddr(res.options.Options.URL)
 
 	// On success, keep the connection for this host and return the client to
 	// the pool so it is actually reused. Otherwise close everything: a client
@@ -650,7 +658,7 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 			return
 		}
 		if keepAlive && res.options.Options.EnableConnectionReuse {
-			transport.CloseIdleConnections(hostPort)
+			transport.closeIdleConnectionsExcept(hostPort)
 			maxIdle := res.options.Options.MaxIdleClients
 			if maxIdle <= 0 {
 				maxIdle = 512
@@ -688,7 +696,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 			b.WriteByte(byte(messageLength))
 			b.WriteString(message)
 
-			chanWrite <- b.Bytes()
+			if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+				return
+			}
 		}
 
 		return
@@ -744,7 +754,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 			}
 		}
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	{
@@ -790,7 +802,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 						b.WriteByte(byte(bodyChunkLength))
 						b.Write(chunkBuffer[:n])
 
-						chanWrite <- b.Bytes()
+						if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+							return
+						}
 					}
 					// Body fully consumed: connection is clean and safe to reuse
 					keepAlive = resp.StatusCode >= 200 && resp.StatusCode < 400
@@ -819,7 +833,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 				b.WriteByte(byte(bodyChunkLength))
 				b.Write(chunkBuffer[:n])
 
-				chanWrite <- b.Bytes()
+				if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+					return
+				}
 			}
 		}
 	}
@@ -835,7 +851,9 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(3)
 		b.WriteString("end")
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 	}
 }
 
@@ -874,7 +892,9 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(byte(messageLength))
 		b.WriteString(message)
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 		return
 	}
 	defer sseResp.Close()
@@ -923,7 +943,9 @@ func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 			}
 		}
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	// Read SSE events. The label is required: a bare break inside the select
@@ -981,7 +1003,9 @@ sseLoop:
 			b.WriteByte(byte(bodyChunkLength))
 			b.Write(eventBytes)
 
-			chanWrite <- b.Bytes()
+			if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+				return
+			}
 		}
 	}
 
@@ -997,7 +1021,9 @@ sseLoop:
 		b.WriteByte(3)
 		b.WriteString("end")
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 	}
 }
 
@@ -1006,7 +1032,7 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 	defer finishActiveRequest(res.options.RequestID)
 
 	// Connect to WebSocket endpoint
-	conn, resp, err := res.wsClient.Connect(res.options.Options.URL)
+	conn, resp, err := res.wsClient.ConnectContext(res.req.Context(), res.options.Options.URL)
 	if err != nil {
 		// Send error response
 		var b bytes.Buffer
@@ -1034,7 +1060,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(byte(messageLength))
 		b.WriteString(message)
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 		return
 	}
 
@@ -1043,6 +1071,8 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		Response: resp,
 	}
 	defer wsResp.Close()
+	stop := context.AfterFunc(res.req.Context(), func() { _ = conn.Close() })
+	defer stop()
 
 	// Send initial response with headers
 	{
@@ -1088,7 +1118,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 			}
 		}
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	// Send initial connection success message
@@ -1117,7 +1149,9 @@ func dispatchWebSocketAsync(res fullRequest, chanWrite chan []byte) {
 		b.WriteByte(byte(bodyChunkLength))
 		b.Write(msgBytes)
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 	}
 
 	// If there's body data, send it as the first WebSocket message
@@ -1178,7 +1212,9 @@ wsLoop:
 			b.WriteByte(byte(bodyChunkLength))
 			b.Write(msgBytes)
 
-			chanWrite <- b.Bytes()
+			if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+				return
+			}
 		}
 	}
 
@@ -1194,22 +1230,28 @@ wsLoop:
 		b.WriteByte(3)
 		b.WriteString("end")
 
-		chanWrite <- b.Bytes()
+		if !sendResponse(res.req.Context(), chanWrite, b.Bytes()) {
+			return
+		}
 	}
 }
 
 func writeSocket(chanWrite chan []byte, wsSocket *websocket.Conn) {
 	for buf := range chanWrite {
+		_ = wsSocket.SetWriteDeadline(time.Now().Add(30 * time.Second))
 		err := wsSocket.WriteMessage(websocket.BinaryMessage, buf)
 
 		if err != nil {
 			log.Print("Socket WriteMessage Failed" + err.Error())
-			continue
+			return
 		}
 	}
 }
 
 func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer wsSocket.Close()
 	// Closing chanRead lets readProcess (and ultimately writeSocket via
 	// chanWrite) exit once the websocket client disconnects, instead of
 	// leaking those goroutines for every closed connection.
@@ -1231,7 +1273,7 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 		if action, ok := baseMessage["action"]; ok {
 			if action == "exit" {
 				// Respond by sending a close frame and then close the connection.
-				wsSocket.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "exit"))
+				wsSocket.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "exit"), time.Now().Add(time.Second))
 				wsSocket.Close()
 				return
 			}
@@ -1252,7 +1294,7 @@ func readSocket(chanRead chan fullRequest, wsSocket *websocket.Conn) {
 			log.Print("Unmarshal Error", err)
 			return
 		}
-		chanRead <- processRequest(*request)
+		chanRead <- processRequest(*request, ctx)
 	}
 }
 
@@ -1275,12 +1317,11 @@ func readProcess(chanRead chan fullRequest, chanWrite chan []byte) {
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
+	CheckOrigin:     func(r *nhttp.Request) bool { return true },
 }
 
 // WSEndpoint exports the main cycletls function as we websocket connection that clients can connect to
 func WSEndpoint(w nhttp.ResponseWriter, r *nhttp.Request) {
-	upgrader.CheckOrigin = func(r *nhttp.Request) bool { return true }
-
 	// upgrade this connection to a WebSocket
 	// connection
 	ws, err := upgrader.Upgrade(w, r, nil)
@@ -1307,6 +1348,7 @@ func WSEndpoint(w nhttp.ResponseWriter, r *nhttp.Request) {
 		log.Println(body)
 
 	} else {
+		defer ws.Close()
 		chanRead := make(chan fullRequest)
 		chanWrite := make(chan []byte)
 
@@ -1369,9 +1411,9 @@ func responseResolvedIPAddr(rawURL string) string {
 
 	switch parsedURL.Scheme {
 	case "http":
-		return net.JoinHostPort(parsedURL.Host, "80")
+		return net.JoinHostPort(parsedURL.Hostname(), "80")
 	default:
-		return net.JoinHostPort(parsedURL.Host, "443")
+		return net.JoinHostPort(parsedURL.Hostname(), "443")
 	}
 }
 
@@ -1502,6 +1544,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	}
 	req, err := http.NewRequest(Method, URL, bodyReader)
 	if err != nil {
+		httpClient.CloseIdleConnections()
 		return Response{}, err
 	}
 
@@ -1537,8 +1580,12 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	defer func() {
 		resp.Body.Close()
 		if transport, ok := httpClient.Transport.(*roundTripper); ok {
-			if enableConnectionReuse && transport.TotalRequests < options.MaxTotalRequests && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				pushBackClientToPool(options.MaxIdleClients, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy, options.IP)
+			if enableConnectionReuse && (options.MaxTotalRequests <= 0 || transport.TotalRequests < options.MaxTotalRequests) && resp.StatusCode >= 200 && resp.StatusCode < 400 {
+				maxIdle := options.MaxIdleClients
+				if maxIdle <= 0 {
+					maxIdle = 512
+				}
+				pushBackClientToPool(maxIdle, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy, options.IP)
 			} else {
 				transport.TotalRequests = 0
 				transport.CloseIdleConnections() // Close all idle connections

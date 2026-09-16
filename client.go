@@ -375,7 +375,7 @@ func (browser Browser) WebSocketConnect(ctx context.Context, urlStr string) (*we
 	wsClient := NewWebSocketClient(tlsConfig, convertedHeaders)
 
 	// Connect and return
-	conn, resp, err := wsClient.Connect(urlStr)
+	conn, resp, err := wsClient.ConnectContext(ctx, urlStr)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -429,5 +429,11 @@ func (browser Browser) SSEConnect(ctx context.Context, urlStr string) (*SSERespo
 	sseClient := NewSSEClient(httpClient, headers)
 
 	// Connect to SSE endpoint
-	return sseClient.Connect(ctx, urlStr)
+	resp, err := sseClient.Connect(ctx, urlStr)
+	if err != nil {
+		httpClient.CloseIdleConnections()
+		return nil, err
+	}
+	resp.onClose = httpClient.CloseIdleConnections
+	return resp, nil
 }

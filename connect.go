@@ -17,19 +17,62 @@ import (
 	http "github.com/Danny-Dasilva/fhttp"
 	http2 "github.com/Danny-Dasilva/fhttp/http2"
 	"golang.org/x/net/proxy"
-	"h12.io/socks"
 )
 
 type SocksDialer struct {
-	socksDial func(string, string) (net.Conn, error)
+	proxyAddr string
 }
 
-func (d *SocksDialer) DialContext(_ context.Context, network, addr string) (net.Conn, error) {
-	return d.socksDial(network, addr)
+func (d *SocksDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil, err
+	}
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", host)
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IPv4 address for %s", host)
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, network, d.proxyAddr)
+	if err != nil {
+		return nil, err
+	}
+	owned := true
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer func() {
+		stop()
+		if owned {
+			_ = conn.Close()
+		}
+	}()
+	// SOCKS4 CONNECT with the anonymous user ID used by the existing API.
+	request := []byte{4, 1, byte(portNumber >> 8), byte(portNumber), 0, 0, 0, 0, 0}
+	copy(request[4:8], ips[0].To4())
+	if _, err = conn.Write(request); err != nil {
+		return nil, err
+	}
+	var response [8]byte
+	if _, err = io.ReadFull(conn, response[:]); err != nil {
+		return nil, err
+	}
+	if response[1] != 90 {
+		return nil, fmt.Errorf("SOCKS4 CONNECT rejected: code %d", response[1])
+	}
+	if !stop() || ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	owned = false
+	return conn, nil
 }
 
 func (d *SocksDialer) Dial(network, addr string) (net.Conn, error) {
-	return d.socksDial(network, addr)
+	return d.DialContext(context.Background(), network, addr)
 }
 
 // connectDialer allows to configure one-time use HTTP CONNECT client
@@ -47,6 +90,43 @@ type connectDialer struct {
 	cacheH2Mu          sync.Mutex
 	cachedH2ClientConn *http2.ClientConn
 	cachedH2RawConn    net.Conn
+	h2Connections      map[*http2.ClientConn]*proxyH2Connection
+}
+
+type proxyH2Connection struct {
+	active  int
+	closing bool
+}
+
+// CloseIdleConnections retires the proxy sessions. Active tunnels keep their
+// session until their last Close, so another request's stream is not aborted.
+func (c *connectDialer) CloseIdleConnections() {
+	c.cacheH2Mu.Lock()
+	defer c.cacheH2Mu.Unlock()
+	c.cachedH2ClientConn = nil
+	c.cachedH2RawConn = nil
+	for conn, state := range c.h2Connections {
+		state.closing = true
+		if state.active == 0 {
+			_ = conn.Close()
+			delete(c.h2Connections, conn)
+		}
+	}
+}
+
+func (c *connectDialer) releaseH2(conn *http2.ClientConn, failed bool) {
+	c.cacheH2Mu.Lock()
+	defer c.cacheH2Mu.Unlock()
+	state := c.h2Connections[conn]
+	state.active--
+	state.closing = state.closing || failed || !c.EnableH2ConnReuse
+	if state.active == 0 && state.closing {
+		_ = conn.Close()
+		delete(c.h2Connections, conn)
+		if c.cachedH2ClientConn == conn {
+			c.cachedH2ClientConn, c.cachedH2RawConn = nil, nil
+		}
+	}
 }
 
 var (
@@ -127,7 +207,7 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 		return client, nil
 	case "socks4":
 		var dialer *SocksDialer
-		dialer = &SocksDialer{socks.DialSocksProxy(socks.SOCKS4, proxyURL.Host)}
+		dialer = &SocksDialer{proxyAddr: proxyURL.Host}
 		client.Dialer = dialer
 		client.DefaultHeader.Set("User-Agent", UserAgent)
 		return client, nil
@@ -187,6 +267,16 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 		}
 	}
 	connectHTTP2 := func(rawConn net.Conn, h2clientConn *http2.ClientConn) (net.Conn, error) {
+		// Reserve the session before beginning the CONNECT stream.
+		c.cacheH2Mu.Lock()
+		if c.h2Connections == nil {
+			c.h2Connections = make(map[*http2.ClientConn]*proxyH2Connection)
+		}
+		if c.h2Connections[h2clientConn] == nil {
+			c.h2Connections[h2clientConn] = &proxyH2Connection{}
+		}
+		c.h2Connections[h2clientConn].active++
+		c.cacheH2Mu.Unlock()
 		req.Proto = "HTTP/2.0"
 		req.ProtoMajor = 2
 		req.ProtoMinor = 0
@@ -195,18 +285,27 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 
 		resp, err := h2clientConn.RoundTrip(req)
 		if err != nil {
-			_ = rawConn.Close()
+			_ = pr.Close()
+			_ = pw.Close()
+			c.releaseH2(h2clientConn, true)
 			return nil, err
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			_ = rawConn.Close()
+			_ = resp.Body.Close()
+			_ = pr.Close()
+			_ = pw.Close()
+			c.releaseH2(h2clientConn, true)
 			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status + "StatusCode:" + strconv.Itoa(resp.StatusCode))
 		}
-		return newHTTP2Conn(rawConn, pw, resp.Body), nil
+		conn := newHTTP2Conn(rawConn, pw, resp.Body).(*http2Conn)
+		conn.release = func() { c.releaseH2(h2clientConn, false) }
+		return conn, nil
 	}
 
 	connectHTTP1 := func(rawConn net.Conn) (net.Conn, error) {
+		stop := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
+		defer stop()
 		req.Proto = "HTTP/1.1"
 		req.ProtoMajor = 1
 		req.ProtoMinor = 1
@@ -225,7 +324,12 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 
 		if resp.StatusCode != http.StatusOK {
 			_ = rawConn.Close()
+			_ = resp.Body.Close()
 			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status + " StatusCode:" + strconv.Itoa(resp.StatusCode))
+		}
+		if !stop() || ctx.Err() != nil {
+			_ = rawConn.Close()
+			return nil, ctx.Err()
 		}
 		return rawConn, nil
 	}
@@ -272,12 +376,14 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 				ServerName:         c.ProxyURL.Hostname(),
 				InsecureSkipVerify: true,
 			}
-			tlsConn, err := tls.Dial(network, c.ProxyURL.Host, &tlsConf)
+			conn, err := c.Dialer.DialContext(ctx, network, c.ProxyURL.Host)
 			if err != nil {
 				return nil, err
 			}
-			err = tlsConn.Handshake()
+			tlsConn := tls.Client(conn, &tlsConf)
+			err = tlsConn.HandshakeContext(ctx)
 			if err != nil {
+				_ = conn.Close()
 				return nil, err
 			}
 			negotiatedProtocol = tlsConn.ConnectionState().NegotiatedProtocol
@@ -293,9 +399,11 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 	case "http/1.1":
 		return connectHTTP1(rawConn)
 	case "h2":
+		stop := context.AfterFunc(ctx, func() { _ = rawConn.Close() })
 		//TODO: update this with correct navigator
 		t := http2.Transport{Navigator: "chrome"}
 		h2clientConn, err := t.NewClientConn(rawConn)
+		stop()
 		if err != nil {
 			_ = rawConn.Close()
 			return nil, err
@@ -309,8 +417,20 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 		}
 		if c.EnableH2ConnReuse {
 			c.cacheH2Mu.Lock()
-			c.cachedH2ClientConn = h2clientConn
-			c.cachedH2RawConn = rawConn
+			if old := c.cachedH2ClientConn; old != nil && old != h2clientConn {
+				state := c.h2Connections[old]
+				if state != nil {
+					state.closing = true
+					if state.active == 0 {
+						_ = old.Close()
+						delete(c.h2Connections, old)
+					}
+				}
+			}
+			if state := c.h2Connections[h2clientConn]; state != nil && !state.closing {
+				c.cachedH2ClientConn = h2clientConn
+				c.cachedH2RawConn = rawConn
+			}
 			c.cacheH2Mu.Unlock()
 		}
 		return proxyConn, err
@@ -327,8 +447,11 @@ func newHTTP2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadClose
 
 type http2Conn struct {
 	net.Conn
-	in  *io.PipeWriter
-	out io.ReadCloser
+	in        *io.PipeWriter
+	out       io.ReadCloser
+	release   func()
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (h *http2Conn) Read(p []byte) (n int, err error) {
@@ -340,14 +463,13 @@ func (h *http2Conn) Write(p []byte) (n int, err error) {
 }
 
 func (h *http2Conn) Close() error {
-	var retErr error = nil
-	if err := h.in.Close(); err != nil {
-		retErr = err
-	}
-	if err := h.out.Close(); err != nil {
-		retErr = err
-	}
-	return retErr
+	h.closeOnce.Do(func() {
+		h.closeErr = errors.Join(h.in.Close(), h.out.Close())
+		if h.release != nil {
+			h.release()
+		}
+	})
+	return h.closeErr
 }
 
 func (h *http2Conn) CloseConn() error {

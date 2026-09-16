@@ -9,6 +9,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -120,15 +121,23 @@ type SSEResponse struct {
 	Scanner *bufio.Scanner
 
 	// client is the SSE client that created this response
-	client *SSEClient
+	client    *SSEClient
+	onClose   func()
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // Close closes the SSE connection
 func (r *SSEResponse) Close() error {
-	if r.Response != nil && r.Response.Body != nil {
-		return r.Response.Body.Close()
-	}
-	return nil
+	r.closeOnce.Do(func() {
+		if r.Response != nil && r.Response.Body != nil {
+			r.closeErr = r.Response.Body.Close()
+		}
+		if r.onClose != nil {
+			r.onClose()
+		}
+	})
+	return r.closeErr
 }
 
 // NextEvent reads the next event from the SSE stream

@@ -360,6 +360,7 @@ func (rt *HTTP3RoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		Cancel:           req.Cancel,
 		Response:         nil,
 	}
+	stdReq = stdReq.WithContext(req.Context())
 
 	// Use the custom dialer if set, otherwise use the forwarder
 	if rt.Dialer != nil {
@@ -379,6 +380,7 @@ func (rt *HTTP3RoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 		stdResp, err := customRT.RoundTrip(stdReq)
 		if err != nil {
+			_ = customRT.Close()
 			return nil, err
 		}
 
@@ -390,7 +392,7 @@ func (rt *HTTP3RoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 			ProtoMajor:       stdResp.ProtoMajor,
 			ProtoMinor:       stdResp.ProtoMinor,
 			Header:           ConvertHttpHeader(stdResp.Header),
-			Body:             stdResp.Body,
+			Body:             newHTTP3OwnedBody(stdResp.Body, customRT, nil),
 			ContentLength:    stdResp.ContentLength,
 			TransferEncoding: stdResp.TransferEncoding,
 			Close:            stdResp.Close,
@@ -426,12 +428,37 @@ func (rt *HTTP3RoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	}, nil
 }
 
+// Close releases the persistent forwarder's QUIC connections and UDP socket.
+func (rt *HTTP3RoundTripper) Close() error {
+	return rt.Forwarder.Close()
+}
+
+func (rt *HTTP3RoundTripper) CloseIdleConnections() {
+	rt.Forwarder.CloseIdleConnections()
+}
+
 // HTTP3Connection represents an HTTP/3 connection with associated metadata
 type HTTP3Connection struct {
 	QuicConn interface{} // Can be *quic.Conn or uquic.EarlyConnection
 	RawConn  net.PacketConn
 	Proxys   []string
 	IsUQuic  bool // Flag to indicate if this is a UQuic connection
+}
+
+func (c *HTTP3Connection) Close() error {
+	var err error
+	switch conn := c.QuicConn.(type) {
+	case *quic.Conn:
+		err = conn.CloseWithError(0, "request completed")
+	case uquic.EarlyConnection:
+		err = conn.CloseWithError(0, "request completed")
+	}
+	if c.RawConn != nil {
+		if closeErr := c.RawConn.Close(); err == nil {
+			err = closeErr
+		}
+	}
+	return err
 }
 
 // http3Dial establishes a UDP connection for HTTP/3 with proxy support
@@ -481,7 +508,7 @@ func (rt *roundTripper) ghttp3Dial(ctx context.Context, remoteAddr, port string,
 		remoteHost = rt.RequestIP
 	} else if net.ParseIP(remoteAddr) == nil {
 		// If remoteAddr is not an IP, resolve it
-		ips, err := net.LookupIP(remoteAddr)
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", remoteAddr)
 		if err != nil {
 			udpConn.Close()
 			return nil, fmt.Errorf("failed to resolve host %s: %w", remoteAddr, err)
@@ -546,6 +573,9 @@ func (rt *roundTripper) ghttp3Dial(ctx context.Context, remoteAddr, port string,
 
 // uhttp3Dial performs HTTP/3 dialing using UQuic for QUIC fingerprinting
 func (rt *roundTripper) uhttp3Dial(ctx context.Context, spec *uquic.QUICSpec, remoteAddr, port string, proxys ...string) (*HTTP3Connection, error) {
+	if rt.TLSConfig == nil {
+		return nil, fmt.Errorf("TLS config is required for UQuic HTTP/3")
+	}
 	// Establish UDP connection
 	udpConn, err := rt.http3Dial(ctx, remoteAddr, port, proxys...)
 	if err != nil {
@@ -553,9 +583,6 @@ func (rt *roundTripper) uhttp3Dial(ctx context.Context, spec *uquic.QUICSpec, re
 	}
 
 	// Configure TLS with uTLS config - use utls.Config directly (matches reference implementation)
-	if rt.TLSConfig == nil {
-		return nil, fmt.Errorf("TLS config is required for UQuic HTTP/3")
-	}
 	tlsConfig := rt.TLSConfig.Clone()
 	tlsConfig.NextProtos = []string{http3.NextProtoH3}
 	tlsConfig.ServerName = remoteAddr
@@ -566,7 +593,7 @@ func (rt *roundTripper) uhttp3Dial(ctx context.Context, spec *uquic.QUICSpec, re
 		remoteHost = rt.RequestIP
 	} else if net.ParseIP(remoteAddr) == nil {
 		// If remoteAddr is not an IP, resolve it
-		ips, err := net.LookupIP(remoteAddr)
+		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", remoteAddr)
 		if err != nil {
 			udpConn.Close()
 			return nil, fmt.Errorf("failed to resolve host %s: %w", remoteAddr, err)

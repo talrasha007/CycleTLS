@@ -24,7 +24,7 @@ var errProtocolNegotiated = errors.New("protocol negotiated")
 var globalClientSessionCache = utls.NewLRUClientSessionCache(16384)
 
 type roundTripper struct {
-	sync.Mutex
+	contextMutex
 
 	TotalRequests int64
 
@@ -115,23 +115,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 			if err != nil {
 				return nil, fmt.Errorf("uhttp3 dial failed: %w", err)
 			}
-			defer func() {
-				if conn.RawConn != nil {
-					conn.RawConn.Close()
-				}
-				// Close the QUIC connection based on its type
-				if conn.QuicConn != nil {
-					if conn.IsUQuic {
-						if uquicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-							uquicConn.CloseWithError(0, "request completed")
-						}
-					} else {
-						if quicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-							quicConn.CloseWithError(0, "request completed")
-						}
-					}
-				}
-			}()
+			defer conn.Close()
 
 			// Use the HTTP/3 connection to make the request
 			return rt.makeHTTP3Request(req, conn)
@@ -142,23 +126,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err != nil {
 			return nil, fmt.Errorf("ghttp3 dial failed: %w", err)
 		}
-		defer func() {
-			if conn.RawConn != nil {
-				conn.RawConn.Close()
-			}
-			// Close the QUIC connection based on its type
-			if conn.QuicConn != nil {
-				if conn.IsUQuic {
-					if uquicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-						uquicConn.CloseWithError(0, "request completed")
-					}
-				} else {
-					if quicConn, ok := conn.QuicConn.(interface{ CloseWithError(uint64, string) error }); ok {
-						quicConn.CloseWithError(0, "request completed")
-					}
-				}
-			}
-		}()
+		defer conn.Close()
 
 		// Use the HTTP/3 connection to make the request
 		return rt.makeHTTP3Request(req, conn)
@@ -176,7 +144,9 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (rt *roundTripper) GetCached(req *http.Request, addr string) (http.RoundTripper, error) {
-	rt.Lock()
+	if err := rt.LockContext(req.Context()); err != nil {
+		return nil, err
+	}
 	defer rt.Unlock()
 
 	cacheAddr := rt.getDialAddr(addr)
@@ -197,7 +167,8 @@ func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 	case "http":
 		// Allow connection reuse by removing DisableKeepAlives
 		rt.cachedTransports[rt.getDialAddr(addr)] = &http.Transport{
-			DialContext: rt.dialContext,
+			DialContext:     rt.dialContext,
+			IdleConnTimeout: 90 * time.Second,
 		}
 		return nil
 	case "https":
@@ -221,7 +192,9 @@ func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 }
 
 func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
-	rt.Lock()
+	if err := rt.LockContext(ctx); err != nil {
+		return nil, err
+	}
 	defer rt.Unlock()
 
 	return rt.dialTLSImpl(ctx, network, addr)
@@ -232,6 +205,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 
 	// Return cached connection if available
 	if conn := rt.cachedConnections[dialAddr]; conn != nil {
+		delete(rt.cachedConnections, dialAddr)
 		return conn, nil
 	}
 
@@ -241,6 +215,12 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 		return nil, err
 	}
 	rt.recordResolvedIP(addr, rawConn)
+	owned := true
+	defer func() {
+		if owned {
+			_ = rawConn.Close()
+		}
+	}()
 
 	// Extract host from address
 	var host string
@@ -304,8 +284,11 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 	}
 
 	// Perform TLS handshake
-	if err = conn.Handshake(); err != nil {
+	if err = conn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 
 		if err.Error() == "tls: CurvePreferences includes unsupported curve" {
 			// Check if TLS 1.3 retry is enabled
@@ -326,6 +309,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 
 	// If transport already exists, return connection
 	if rt.cachedTransports[dialAddr] != nil {
+		owned = false
 		return conn, nil
 	}
 
@@ -345,7 +329,6 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 			}
 
 			http2Transport = http2.Transport{
-				DialTLS:     rt.dialTLSHTTP2,
 				PushHandler: &http2.DefaultPushHandler{},
 				Navigator:   parsedUserAgent.UserAgent,
 			}
@@ -354,23 +337,23 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 			h2Fingerprint.Apply(&http2Transport)
 		} else {
 			http2Transport = http2.Transport{
-				DialTLS:     rt.dialTLSHTTP2,
 				PushHandler: &http2.DefaultPushHandler{},
 				Navigator:   parsedUserAgent.UserAgent,
 			}
 		}
 
-		rt.cachedTransports[dialAddr] = &http2Transport
+		rt.cachedTransports[dialAddr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
 	default:
-		// HTTP/1.x transport - configure to avoid idle channel errors
+		// The transport owns the connection after the first dial callback.
 		rt.cachedTransports[dialAddr] = &http.Transport{
-			DialTLSContext:    rt.dialTLS,
-			DisableKeepAlives: true, // Disable keep-alives to prevent idle channel errors
+			DialTLSContext:  rt.dialTLS,
+			IdleConnTimeout: 90 * time.Second,
 		}
 	}
 
 	// Cache the connection for future use
 	rt.cachedConnections[dialAddr] = conn
+	owned = false
 
 	return nil, errProtocolNegotiated
 }
@@ -385,6 +368,12 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 		return nil, err
 	}
 	rt.recordResolvedIP(addr, rawConn)
+	owned := true
+	defer func() {
+		if owned {
+			_ = rawConn.Close()
+		}
+	}()
 
 	var spec *utls.ClientHelloSpec
 
@@ -428,9 +417,13 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 	}
 
 	// Perform TLS handshake for retry
-	if err = conn.Handshake(); err != nil {
+	if err = conn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("TLS 1.3 compatible handshake failed: %+v", err)
+	}
+	if rt.cachedTransports[dialAddr] != nil {
+		owned = false
+		return conn, nil
 	}
 
 	// Create appropriate transport based on negotiated protocol
@@ -447,7 +440,6 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 			}
 
 			http2Transport = http2.Transport{
-				DialTLS:     rt.dialTLSHTTP2,
 				PushHandler: &http2.DefaultPushHandler{},
 				Navigator:   parsedUserAgent.UserAgent,
 			}
@@ -455,23 +447,23 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 			h2Fingerprint.Apply(&http2Transport)
 		} else {
 			http2Transport = http2.Transport{
-				DialTLS:     rt.dialTLSHTTP2,
 				PushHandler: &http2.DefaultPushHandler{},
 				Navigator:   parsedUserAgent.UserAgent,
 			}
 		}
 
-		rt.cachedTransports[dialAddr] = &http2Transport
+		rt.cachedTransports[dialAddr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
 	default:
 		// HTTP/1.x transport
 		rt.cachedTransports[dialAddr] = &http.Transport{
-			DialTLSContext:    rt.dialTLS,
-			DisableKeepAlives: true,
+			DialTLSContext:  rt.dialTLS,
+			IdleConnTimeout: 90 * time.Second,
 		}
 	}
 
 	// Cache the successful TLS 1.3 connection
 	rt.cachedConnections[dialAddr] = conn
+	owned = false
 
 	return nil, errProtocolNegotiated
 }
@@ -486,6 +478,12 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 		return nil, err
 	}
 	rt.recordResolvedIP(addr, rawConn)
+	owned := true
+	defer func() {
+		if owned {
+			_ = rawConn.Close()
+		}
+	}()
 
 	// Use original TLS 1.2 JA3 spec (no upgrade)
 	spec, err := StringToSpec(rt.JA3, rt.ForceTLS12, rt.UserAgent, rt.ForceHTTP1, rt.SignatureAlgorithms, rt.PaddingExtension)
@@ -506,9 +504,13 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 	}
 
 	// Perform TLS handshake for fallback
-	if err = conn.Handshake(); err != nil {
+	if err = conn.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("original TLS 1.2 handshake failed: %+v", err)
+	}
+	if rt.cachedTransports[dialAddr] != nil {
+		owned = false
+		return conn, nil
 	}
 
 	// Create appropriate transport based on negotiated protocol
@@ -525,7 +527,6 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 			}
 
 			http2Transport = http2.Transport{
-				DialTLS:     rt.dialTLSHTTP2,
 				PushHandler: &http2.DefaultPushHandler{},
 				Navigator:   parsedUserAgent.UserAgent,
 			}
@@ -533,29 +534,25 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 			h2Fingerprint.Apply(&http2Transport)
 		} else {
 			http2Transport = http2.Transport{
-				DialTLS:     rt.dialTLSHTTP2,
 				PushHandler: &http2.DefaultPushHandler{},
 				Navigator:   parsedUserAgent.UserAgent,
 			}
 		}
 
-		rt.cachedTransports[dialAddr] = &http2Transport
+		rt.cachedTransports[dialAddr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
 	default:
 		// HTTP/1.x transport
 		rt.cachedTransports[dialAddr] = &http.Transport{
-			DialTLSContext:    rt.dialTLS,
-			DisableKeepAlives: true,
+			DialTLSContext:  rt.dialTLS,
+			IdleConnTimeout: 90 * time.Second,
 		}
 	}
 
 	// Cache the successful TLS 1.2 fallback connection
 	rt.cachedConnections[dialAddr] = conn
+	owned = false
 
 	return nil, errProtocolNegotiated
-}
-
-func (rt *roundTripper) dialTLSHTTP2(network, addr string, _ *utls.Config) (net.Conn, error) {
-	return rt.dialTLS(context.Background(), network, addr)
 }
 
 func (rt *roundTripper) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -568,11 +565,14 @@ func (rt *roundTripper) dialContext(ctx context.Context, network, addr string) (
 }
 
 func (rt *roundTripper) getDialTLSAddr(req *http.Request) string {
-	host, port, err := net.SplitHostPort(req.URL.Host)
-	if err == nil {
-		return net.JoinHostPort(host, port)
+	port := req.URL.Port()
+	if port == "" {
+		port = "443"
+		if strings.EqualFold(req.URL.Scheme, "http") {
+			port = "80"
+		}
 	}
-	return net.JoinHostPort(req.URL.Host, "443") // Default HTTPS port
+	return net.JoinHostPort(req.URL.Hostname(), port)
 }
 
 func (rt *roundTripper) getDialAddr(addr string) string {
@@ -635,31 +635,34 @@ func (rt *roundTripper) canRecordResolvedIP() bool {
 	}
 }
 
-// CloseIdleConnections closes connections that have been idle for too long
-// If selectedAddr is provided, only close connections not matching this address
-func (rt *roundTripper) CloseIdleConnections(selectedAddr ...string) {
+// CloseIdleConnections implements the optional http.RoundTripper cleanup hook.
+func (rt *roundTripper) CloseIdleConnections() {
+	rt.closeIdleConnectionsExcept("")
+}
+
+func (rt *roundTripper) closeIdleConnectionsExcept(selectedAddr string) {
 	rt.Lock()
 	defer rt.Unlock()
-
-	// If we have a specific address to keep, only close other connections
-	if len(selectedAddr) > 0 && selectedAddr[0] != "" {
-		addr := selectedAddr[0]
-		// Keep the connection for the provided address, close others
-		for connAddr, conn := range rt.cachedConnections {
-			if connAddr != addr {
-				_ = conn.Close()
-				rt.closeCachedTransport(connAddr)
-				delete(rt.cachedConnections, connAddr)
-				delete(rt.cachedTransports, connAddr)
-			}
-		}
-	} else {
-		// No address specified, close all connections (original behavior)
-		for addr, conn := range rt.cachedConnections {
+	keep := ""
+	if selectedAddr != "" {
+		keep = rt.getDialAddr(selectedAddr)
+	}
+	for addr, conn := range rt.cachedConnections {
+		if addr != keep {
 			_ = conn.Close()
-			rt.closeCachedTransport(addr)
 			delete(rt.cachedConnections, addr)
-			delete(rt.cachedTransports, addr)
+		}
+	}
+	for addr := range rt.cachedTransports {
+		if addr != keep {
+			rt.closeCachedTransport(addr)
+		}
+	}
+	// Retain transports so connections still in use remain owned and can be
+	// cleaned up on a subsequent call after their responses are closed.
+	if keep == "" {
+		if d, ok := rt.dialer.(interface{ CloseIdleConnections() }); ok {
+			d.CloseIdleConnections()
 		}
 	}
 }
@@ -764,6 +767,8 @@ func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connectio
 		Cancel:           req.Cancel,
 		Response:         nil,
 	}
+
+	stdReq = stdReq.WithContext(req.Context())
 
 	// Use the RoundTripper to make the request
 	stdResp, err := h3Transport.RoundTrip(stdReq)
