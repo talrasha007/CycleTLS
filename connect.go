@@ -267,6 +267,28 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 		}
 	}
 	connectHTTP2 := func(rawConn net.Conn, h2clientConn *http2.ClientConn) (net.Conn, error) {
+		// DialContext cancellation owns setup only. A successful CONNECT is a
+		// long-lived stream, so its context must survive the dialing request.
+		pr, pw := io.Pipe()
+		tunnelCtx, cancelTunnel := context.WithCancel(context.WithoutCancel(ctx))
+		cancelSetup := func() {
+			cancelTunnel()
+			// The dependency waits for the CONNECT body writer on cancellation;
+			// unblock its pipe read while it finishes resetting this stream.
+			pr.CloseWithError(ctx.Err())
+			pw.CloseWithError(ctx.Err())
+		}
+		stop := context.AfterFunc(ctx, cancelSetup)
+		connected := false
+		defer func() {
+			stop()
+			if !connected {
+				cancelTunnel()
+				pr.Close()
+				pw.Close()
+			}
+		}()
+		connectReq := req.WithContext(tunnelCtx)
 		// Reserve the session before beginning the CONNECT stream.
 		c.cacheH2Mu.Lock()
 		if c.h2Connections == nil {
@@ -277,13 +299,21 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 		}
 		c.h2Connections[h2clientConn].active++
 		c.cacheH2Mu.Unlock()
-		req.Proto = "HTTP/2.0"
-		req.ProtoMajor = 2
-		req.ProtoMinor = 0
-		pr, pw := io.Pipe()
-		req.Body = pr
+		connectReq.Proto = "HTTP/2.0"
+		connectReq.ProtoMajor = 2
+		connectReq.ProtoMinor = 0
+		connectReq.Body = pr
 
-		resp, err := h2clientConn.RoundTrip(req)
+		resp, err := h2clientConn.RoundTrip(connectReq)
+		if !stop() {
+			cancelSetup()
+		}
+		if tunnelCtx.Err() != nil {
+			if resp != nil {
+				resp.Body.Close()
+			}
+			err = tunnelCtx.Err()
+		}
 		if err != nil {
 			_ = pr.Close()
 			_ = pw.Close()
@@ -299,7 +329,11 @@ func (c *connectDialer) DialContext(ctx context.Context, network, address string
 			return nil, errors.New("Proxy responded with non 200 code: " + resp.Status + "StatusCode:" + strconv.Itoa(resp.StatusCode))
 		}
 		conn := newHTTP2Conn(rawConn, pw, resp.Body).(*http2Conn)
-		conn.release = func() { c.releaseH2(h2clientConn, false) }
+		conn.release = func() {
+			cancelTunnel()
+			c.releaseH2(h2clientConn, false)
+		}
+		connected = true
 		return conn, nil
 	}
 

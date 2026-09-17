@@ -17,11 +17,14 @@ import (
 // request context. The wrapper tracks reservations through response-body
 // completion because the dependency does not expose an idle-connection API.
 type contextHTTP2Transport struct {
-	transport *http2.Transport
-	dial      func(context.Context, string, string) (net.Conn, error)
-	mu        sync.Mutex
-	conns     map[*http2.ClientConn]*http2Connection
-	dialing   chan struct{}
+	transport  *http2.Transport
+	dial       func(context.Context, string, string) (net.Conn, error)
+	mu         sync.Mutex
+	conns      map[*http2.ClientConn]*http2Connection
+	dialing    chan struct{}
+	dialCancel context.CancelFunc
+	closed     bool
+	done       chan struct{}
 }
 
 type http2Connection struct {
@@ -35,7 +38,11 @@ type http2LeaseKey struct{}
 type http2Lease map[*http2.ClientConn]bool
 
 func newContextHTTP2Transport(t *http2.Transport, dial func(context.Context, string, string) (net.Conn, error)) *contextHTTP2Transport {
-	p := &contextHTTP2Transport{transport: t, dial: dial, conns: make(map[*http2.ClientConn]*http2Connection)}
+	// Let the dependency reserve stream slots under its connection lock. Its
+	// non-strict CanTakeNewRequest check cannot reserve a slot for this pool,
+	// so simultaneous callers otherwise race into retries and extra dials.
+	t.StrictMaxConcurrentStreams = true
+	p := &contextHTTP2Transport{transport: t, dial: dial, conns: make(map[*http2.ClientConn]*http2Connection), done: make(chan struct{})}
 	t.ConnPool = p
 	return p
 }
@@ -64,6 +71,10 @@ func (p *contextHTTP2Transport) GetClientConn(req *http.Request, addr string) (*
 			return nil, err
 		}
 		p.mu.Lock()
+		if p.closed {
+			p.mu.Unlock()
+			return nil, net.ErrClosed
+		}
 		for cc, state := range p.conns {
 			if !singleUse && !state.singleUse && !state.retired && state.addr == addr && cc.CanTakeNewRequest() {
 				if !lease[cc] {
@@ -81,20 +92,33 @@ func (p *contextHTTP2Transport) GetClientConn(req *http.Request, addr string) (*
 				continue
 			case <-ctx.Done():
 				return nil, ctx.Err()
+			case <-p.done:
+				return nil, net.ErrClosed
 			}
 		}
 		p.dialing = make(chan struct{})
+		dialCtx, cancel := context.WithCancel(ctx)
+		p.dialCancel = cancel
 		p.mu.Unlock()
 
-		cc, err := p.dialClientConn(ctx, addr)
+		cc, err := p.dialClientConn(dialCtx, addr)
+		cancel()
 		p.mu.Lock()
+		if p.closed {
+			err = net.ErrClosed
+		}
 		if err == nil {
 			p.conns[cc] = &http2Connection{addr: addr, users: 1, singleUse: singleUse, retired: !cc.CanTakeNewRequest()}
 			lease[cc] = true
 		}
 		close(p.dialing)
 		p.dialing = nil
+		p.dialCancel = nil
 		p.mu.Unlock()
+		if err != nil && cc != nil {
+			cc.Close()
+			cc = nil
+		}
 		return cc, err
 	}
 }
@@ -173,6 +197,28 @@ func (p *contextHTTP2Transport) CloseIdleConnections() {
 	for _, cc := range closing {
 		cc.Close()
 	}
+}
+
+// Close permanently shuts down the pool, including active streams and setup.
+func (p *contextHTTP2Transport) Close() error {
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil
+	}
+	p.closed = true
+	close(p.done)
+	cancel := p.dialCancel
+	closing := p.conns
+	p.conns = make(map[*http2.ClientConn]*http2Connection)
+	p.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	for cc := range closing {
+		cc.Close()
+	}
+	return nil
 }
 
 type http2ResponseBody struct {

@@ -2,21 +2,18 @@ package cycletls
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
-	stdhttp "net/http"
 	"strings"
 	"sync"
 	"time"
 
 	http "github.com/Danny-Dasilva/fhttp"
 	http2 "github.com/Danny-Dasilva/fhttp/http2"
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 	uquic "github.com/refraction-networking/uquic"
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/idna"
 	"golang.org/x/net/proxy"
 )
 
@@ -26,7 +23,9 @@ var globalClientSessionCache = utls.NewLRUClientSessionCache(16384)
 type roundTripper struct {
 	contextMutex
 
-	TotalRequests int64
+	poolEntry      *ClientPoolEntry // immutable after publication in the client registry
+	closed         bool
+	http3Transport *HTTP3RoundTripper
 
 	// TLS fingerprinting options
 	PaddingExtension         *utls.UtlsPaddingExtension
@@ -65,9 +64,36 @@ type roundTripper struct {
 	dialer proxy.ContextDialer
 }
 
+type requestSettingsKey struct{}
+
+type requestSettings struct {
+	userAgent   string
+	cookies     []Cookie
+	headerOrder []string
+}
+
+// Keep per-request defaults out of the shared transport. The value also follows
+// redirects and SSE requests without mutating a shared client or its settings.
+func withRequestSettings(ctx context.Context, browser Browser) context.Context {
+	settings := requestSettings{
+		userAgent:   browser.UserAgent,
+		cookies:     append([]Cookie(nil), browser.Cookies...),
+		headerOrder: append([]string(nil), browser.HeaderOrder...),
+	}
+	for i := range settings.cookies {
+		settings.cookies[i].Unparsed = append([]string(nil), settings.cookies[i].Unparsed...)
+	}
+	return context.WithValue(ctx, requestSettingsKey{}, settings)
+}
+
 func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	settings, ok := req.Context().Value(requestSettingsKey{}).(requestSettings)
+	if !ok {
+		// Standalone NewTransport clients retain their configured defaults.
+		settings = requestSettings{userAgent: rt.UserAgent, cookies: rt.Cookies, headerOrder: rt.HeaderOrder}
+	}
 	// Apply cookies to the request
-	for _, properties := range rt.Cookies {
+	for _, properties := range settings.cookies {
 		cookie := &http.Cookie{
 			Name:       properties.Name,
 			Value:      properties.Value,
@@ -85,13 +111,18 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Apply user agent
-	req.Header.Set("User-Agent", rt.UserAgent)
+	req.Header.Set("User-Agent", settings.userAgent)
 
 	// Apply header order if specified (for regular headers, not pseudo-headers)
-	if len(rt.HeaderOrder) > 0 {
-		req.Header = ConvertHttpHeader(MarshalHeader(req.Header, rt.HeaderOrder))
+	if len(settings.headerOrder) > 0 {
+		order := make([]string, len(settings.headerOrder))
+		for i, name := range settings.headerOrder {
+			order[i] = strings.ToLower(name)
+		}
+		// Go maps have no insertion order; fhttp consumes this metadata on wire.
+		req.Header[http.HeaderOrderKey] = order
 
-		// Note: rt.HeaderOrder contains regular headers like "cache-control", "accept", etc.
+		// HeaderOrder contains regular headers like "cache-control", "accept", etc.
 		// Do NOT overwrite http.PHeaderOrderKey which contains pseudo-headers like ":method", ":path"
 		// The pseudo-header order is already set correctly in index.go based on UserAgent parsing
 	}
@@ -99,42 +130,16 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	// Get address for dialing
 	addr := rt.getDialTLSAddr(req)
 
-	// Check if we need HTTP/3 - matches reference implementation pattern
 	if rt.ForceHTTP3 {
-		// Extract host and port from request
-		host := req.URL.Hostname()
-		port := req.URL.Port()
-		if port == "" {
-			port = "443" // Default HTTPS port
-		}
-
-		// Check for USpec (matches reference implementation logic)
-		if rt.USpec != nil {
-			// Use UQuic-based HTTP/3 dialing
-			conn, err := rt.uhttp3Dial(req.Context(), rt.USpec, host, port)
-			if err != nil {
-				return nil, fmt.Errorf("uhttp3 dial failed: %w", err)
-			}
-			defer conn.Close()
-
-			// Use the HTTP/3 connection to make the request
-			return rt.makeHTTP3Request(req, conn)
-		}
-
-		// Fall back to standard HTTP/3 dialing
-		conn, err := rt.ghttp3Dial(req.Context(), host, port)
-		if err != nil {
-			return nil, fmt.Errorf("ghttp3 dial failed: %w", err)
-		}
-		defer conn.Close()
-
-		// Use the HTTP/3 connection to make the request
-		return rt.makeHTTP3Request(req, conn)
+		return rt.roundTripHTTP3(req)
 	}
 
 	// Use cached transport if available, otherwise create a new one
 	cached, err := rt.GetCached(req, addr)
 	if err != nil {
+		if req.Body != nil {
+			req.Body.Close()
+		}
 		return nil, err
 	}
 
@@ -148,8 +153,13 @@ func (rt *roundTripper) GetCached(req *http.Request, addr string) (http.RoundTri
 		return nil, err
 	}
 	defer rt.Unlock()
+	if rt.closed {
+		return nil, net.ErrClosed
+	}
 
-	cacheAddr := rt.getDialAddr(addr)
+	// TLS identity is the logical origin, even when several origins share an
+	// explicit RequestIP. A negotiated socket must not migrate between SNIs.
+	cacheAddr := addr
 	if cached, ok := rt.cachedTransports[cacheAddr]; ok {
 		return cached, nil
 	}
@@ -166,7 +176,7 @@ func (rt *roundTripper) getTransport(req *http.Request, addr string) error {
 	switch strings.ToLower(req.URL.Scheme) {
 	case "http":
 		// Allow connection reuse by removing DisableKeepAlives
-		rt.cachedTransports[rt.getDialAddr(addr)] = &http.Transport{
+		rt.cachedTransports[addr] = &http.Transport{
 			DialContext:     rt.dialContext,
 			IdleConnTimeout: 90 * time.Second,
 		}
@@ -196,6 +206,9 @@ func (rt *roundTripper) dialTLS(ctx context.Context, network, addr string) (net.
 		return nil, err
 	}
 	defer rt.Unlock()
+	if rt.closed {
+		return nil, net.ErrClosed
+	}
 
 	return rt.dialTLSImpl(ctx, network, addr)
 }
@@ -204,8 +217,8 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 	dialAddr := rt.getDialAddr(addr)
 
 	// Return cached connection if available
-	if conn := rt.cachedConnections[dialAddr]; conn != nil {
-		delete(rt.cachedConnections, dialAddr)
+	if conn := rt.cachedConnections[addr]; conn != nil {
+		delete(rt.cachedConnections, addr)
 		return conn, nil
 	}
 
@@ -308,7 +321,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 	}
 
 	// If transport already exists, return connection
-	if rt.cachedTransports[dialAddr] != nil {
+	if rt.cachedTransports[addr] != nil {
 		owned = false
 		return conn, nil
 	}
@@ -342,17 +355,17 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 			}
 		}
 
-		rt.cachedTransports[dialAddr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
+		rt.cachedTransports[addr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
 	default:
 		// The transport owns the connection after the first dial callback.
-		rt.cachedTransports[dialAddr] = &http.Transport{
+		rt.cachedTransports[addr] = &http.Transport{
 			DialTLSContext:  rt.dialTLS,
 			IdleConnTimeout: 90 * time.Second,
 		}
 	}
 
 	// Cache the connection for future use
-	rt.cachedConnections[dialAddr] = conn
+	rt.cachedConnections[addr] = conn
 	owned = false
 
 	return nil, errProtocolNegotiated
@@ -421,7 +434,7 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 		_ = conn.Close()
 		return nil, fmt.Errorf("TLS 1.3 compatible handshake failed: %+v", err)
 	}
-	if rt.cachedTransports[dialAddr] != nil {
+	if rt.cachedTransports[addr] != nil {
 		owned = false
 		return conn, nil
 	}
@@ -452,17 +465,17 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 			}
 		}
 
-		rt.cachedTransports[dialAddr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
+		rt.cachedTransports[addr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
 	default:
 		// HTTP/1.x transport
-		rt.cachedTransports[dialAddr] = &http.Transport{
+		rt.cachedTransports[addr] = &http.Transport{
 			DialTLSContext:  rt.dialTLS,
 			IdleConnTimeout: 90 * time.Second,
 		}
 	}
 
 	// Cache the successful TLS 1.3 connection
-	rt.cachedConnections[dialAddr] = conn
+	rt.cachedConnections[addr] = conn
 	owned = false
 
 	return nil, errProtocolNegotiated
@@ -508,7 +521,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 		_ = conn.Close()
 		return nil, fmt.Errorf("original TLS 1.2 handshake failed: %+v", err)
 	}
-	if rt.cachedTransports[dialAddr] != nil {
+	if rt.cachedTransports[addr] != nil {
 		owned = false
 		return conn, nil
 	}
@@ -539,17 +552,17 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 			}
 		}
 
-		rt.cachedTransports[dialAddr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
+		rt.cachedTransports[addr] = newContextHTTP2Transport(&http2Transport, rt.dialTLS)
 	default:
 		// HTTP/1.x transport
-		rt.cachedTransports[dialAddr] = &http.Transport{
+		rt.cachedTransports[addr] = &http.Transport{
 			DialTLSContext:  rt.dialTLS,
 			IdleConnTimeout: 90 * time.Second,
 		}
 	}
 
 	// Cache the successful TLS 1.2 fallback connection
-	rt.cachedConnections[dialAddr] = conn
+	rt.cachedConnections[addr] = conn
 	owned = false
 
 	return nil, errProtocolNegotiated
@@ -572,7 +585,11 @@ func (rt *roundTripper) getDialTLSAddr(req *http.Request) string {
 			port = "80"
 		}
 	}
-	return net.JoinHostPort(req.URL.Hostname(), port)
+	host := req.URL.Hostname()
+	if ascii, err := idna.ToASCII(host); err == nil {
+		host = ascii
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func (rt *roundTripper) getDialAddr(addr string) string {
@@ -640,12 +657,45 @@ func (rt *roundTripper) CloseIdleConnections() {
 	rt.closeIdleConnectionsExcept("")
 }
 
+// Close disposes a retired transport generation. The shared client registry
+// waits until every acquired request has released its response before calling.
+func (rt *roundTripper) Close() error {
+	rt.Lock()
+	if rt.closed {
+		rt.Unlock()
+		return nil
+	}
+	rt.closed = true
+	conns, transports, h3 := rt.cachedConnections, rt.cachedTransports, rt.http3Transport
+	rt.cachedConnections = make(map[string]net.Conn)
+	rt.cachedTransports = make(map[string]http.RoundTripper)
+	rt.Unlock()
+	var closeErr error
+	for _, conn := range conns {
+		closeErr = errors.Join(closeErr, conn.Close())
+	}
+	for _, tr := range transports {
+		if closer, ok := tr.(interface{ Close() error }); ok {
+			closeErr = errors.Join(closeErr, closer.Close())
+		} else if closer, ok := tr.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+	}
+	if h3 != nil {
+		closeErr = errors.Join(closeErr, h3.Close())
+	}
+	if d, ok := rt.dialer.(interface{ CloseIdleConnections() }); ok {
+		d.CloseIdleConnections()
+	}
+	return closeErr
+}
+
 func (rt *roundTripper) closeIdleConnectionsExcept(selectedAddr string) {
 	rt.Lock()
 	defer rt.Unlock()
 	keep := ""
 	if selectedAddr != "" {
-		keep = rt.getDialAddr(selectedAddr)
+		keep = selectedAddr
 	}
 	for addr, conn := range rt.cachedConnections {
 		if addr != keep {
@@ -661,6 +711,9 @@ func (rt *roundTripper) closeIdleConnectionsExcept(selectedAddr string) {
 	// Retain transports so connections still in use remain owned and can be
 	// cleaned up on a subsequent call after their responses are closed.
 	if keep == "" {
+		if rt.http3Transport != nil {
+			rt.http3Transport.CloseIdleConnections()
+		}
 		if d, ok := rt.dialer.(interface{ CloseIdleConnections() }); ok {
 			d.CloseIdleConnections()
 		}
@@ -687,6 +740,19 @@ func newRoundTripper(browser Browser, dialer ...proxy.ContextDialer) http.RoundT
 }
 
 func newRoundTripperWithIP(browser Browser, contextDialer proxy.ContextDialer, requestIP string) http.RoundTripper {
+	// Published transports own their configuration snapshots.
+	browser.HeaderOrder = append([]string(nil), browser.HeaderOrder...)
+	browser.Cookies = append([]Cookie(nil), browser.Cookies...)
+	for i := range browser.Cookies {
+		browser.Cookies[i].Unparsed = append([]string(nil), browser.Cookies[i].Unparsed...)
+	}
+	if browser.TLSConfig != nil {
+		browser.TLSConfig = browser.TLSConfig.Clone()
+	}
+	if browser.PaddingExtension != nil {
+		padding := *browser.PaddingExtension
+		browser.PaddingExtension = &padding
+	}
 	return &roundTripper{
 		dialer:                   contextDialer,
 		EnableClientSessionCache: browser.EnableClientSessionCache,
@@ -714,86 +780,6 @@ func newRoundTripperWithIP(browser Browser, contextDialer proxy.ContextDialer, r
 		// TLS 1.3 specific options
 		TLS13AutoRetry: browser.TLS13AutoRetry,
 	}
-}
-
-// makeHTTP3Request performs an HTTP/3 request using the provided HTTP/3 connection
-func (rt *roundTripper) makeHTTP3Request(req *http.Request, conn *HTTP3Connection) (*http.Response, error) {
-	// Create HTTP/3 RoundTripper with custom dial function that uses our established connection
-	tlsConfig := ConvertUtlsConfig(rt.TLSConfig)
-	if tlsConfig == nil {
-		tlsConfig = &tls.Config{}
-	}
-
-	// Create HTTP/3 Transport - let it establish its own connections for now
-	h3Transport := &http3.Transport{
-		TLSClientConfig: tlsConfig,
-		QUICConfig: &quic.Config{
-			HandshakeIdleTimeout:           30 * time.Second,
-			MaxIdleTimeout:                 90 * time.Second,
-			KeepAlivePeriod:                15 * time.Second,
-			InitialStreamReceiveWindow:     512 * 1024,      // 512 KB
-			MaxStreamReceiveWindow:         2 * 1024 * 1024, // 2 MB
-			InitialConnectionReceiveWindow: 1024 * 1024,     // 1 MB
-			MaxConnectionReceiveWindow:     4 * 1024 * 1024, // 4 MB
-			MaxIncomingStreams:             100,
-			MaxIncomingUniStreams:          100,
-			EnableDatagrams:                false,
-			DisablePathMTUDiscovery:        false,
-			Allow0RTT:                      false,
-		},
-	}
-
-	// Convert fhttp.Request to net/http.Request
-	stdReq := &stdhttp.Request{
-		Method:           req.Method,
-		URL:              req.URL,
-		Proto:            req.Proto,
-		ProtoMajor:       req.ProtoMajor,
-		ProtoMinor:       req.ProtoMinor,
-		Header:           ConvertFhttpHeader(req.Header),
-		Body:             req.Body,
-		GetBody:          req.GetBody,
-		ContentLength:    req.ContentLength,
-		TransferEncoding: req.TransferEncoding,
-		Close:            req.Close,
-		Host:             req.Host,
-		Form:             req.Form,
-		PostForm:         req.PostForm,
-		MultipartForm:    req.MultipartForm,
-		Trailer:          ConvertFhttpHeader(req.Trailer),
-		RemoteAddr:       req.RemoteAddr,
-		RequestURI:       req.RequestURI,
-		TLS:              nil,
-		Cancel:           req.Cancel,
-		Response:         nil,
-	}
-
-	stdReq = stdReq.WithContext(req.Context())
-
-	// Use the RoundTripper to make the request
-	stdResp, err := h3Transport.RoundTrip(stdReq)
-	if err != nil {
-		_ = h3Transport.Close()
-		return nil, err
-	}
-
-	// Convert back to fhttp.Response
-	return &http.Response{
-		Status:           stdResp.Status,
-		StatusCode:       stdResp.StatusCode,
-		Proto:            stdResp.Proto,
-		ProtoMajor:       stdResp.ProtoMajor,
-		ProtoMinor:       stdResp.ProtoMinor,
-		Header:           ConvertHttpHeader(stdResp.Header),
-		Body:             newHTTP3OwnedBody(stdResp.Body, h3Transport, nil),
-		ContentLength:    stdResp.ContentLength,
-		TransferEncoding: stdResp.TransferEncoding,
-		Close:            stdResp.Close,
-		Uncompressed:     stdResp.Uncompressed,
-		Trailer:          ConvertHttpHeader(stdResp.Trailer),
-		Request:          req,
-		TLS:              nil,
-	}, nil
 }
 
 // Default JA3 fingerprint for Chrome

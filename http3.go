@@ -3,6 +3,7 @@ package cycletls
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -14,427 +15,395 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	uquic "github.com/refraction-networking/uquic"
+	"golang.org/x/net/idna"
+	"golang.org/x/net/proxy"
 )
 
-// http3OwnedBody ties the lifetime of a per-request http3.Transport to the
-// response body. The transport owns the QUIC connection, UDP socket and
-// keep-alive goroutines, so it must be closed once the body is consumed.
-type http3OwnedBody struct {
-	io.ReadCloser
-	transport *http3.Transport
-	cancel    context.CancelFunc
-	closeOnce sync.Once
-	closeErr  error
+// sharedHTTP3 owns one transport. Configuration is snapshotted at first use;
+// callers must finish configuration before issuing concurrent requests.
+// active includes requests awaiting headers and response bodies not yet done.
+// quic-go counts only requests awaiting headers for its idle cleanup, so this
+// additional count prevents cleanup from closing a connection with live bodies.
+type sharedHTTP3 struct {
+	mu                sync.Mutex
+	transport         *http3.Transport
+	timeout           time.Duration
+	active            int
+	activeByAuthority map[string]int
+	closed            bool
+	closeDone         chan struct{}
+	closeErr          error
+	idlePending       bool
+	idleDone          chan struct{}
+	dials             map[*context.CancelFunc]string
 }
 
-func newHTTP3OwnedBody(body io.ReadCloser, transport *http3.Transport, cancel context.CancelFunc) io.ReadCloser {
-	return &http3OwnedBody{ReadCloser: body, transport: transport, cancel: cancel}
-}
-
-func (b *http3OwnedBody) Close() error {
-	b.closeOnce.Do(func() {
-		b.closeErr = b.ReadCloser.Close()
-		if b.cancel != nil {
-			b.cancel()
+func (s *sharedHTTP3) acquire(ctx context.Context, authority string, build func() (*http3.Transport, time.Duration)) (*http3.Transport, time.Duration, error) {
+	for {
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			return nil, 0, net.ErrClosed
 		}
-		_ = b.transport.Close()
-	})
+		if done := s.idleDone; done != nil {
+			s.mu.Unlock()
+			select {
+			case <-done:
+				continue
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			}
+		}
+		if s.transport == nil {
+			s.transport, s.timeout = build()
+			t := s.transport
+			if t.TLSClientConfig != nil {
+				t.TLSClientConfig = t.TLSClientConfig.Clone()
+			}
+			if t.QUICConfig != nil {
+				t.QUICConfig = t.QUICConfig.Clone()
+			}
+			dial := t.Dial
+			if dial == nil {
+				dial = quic.DialAddrEarly
+			}
+			// The first request does not own a multiplexed connection's handshake.
+			// Cancel the dial when all interested requests leave, or on Close.
+			t.Dial = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+				dialCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+				s.mu.Lock()
+				if s.closed || s.activeByAuthority[addr] == 0 {
+					cancel()
+				} else {
+					if s.dials == nil {
+						s.dials = make(map[*context.CancelFunc]string)
+					}
+					s.dials[&cancel] = addr
+				}
+				s.mu.Unlock()
+				defer func() { cancel(); s.mu.Lock(); delete(s.dials, &cancel); s.mu.Unlock() }()
+				return dial(dialCtx, addr, tlsCfg, cfg)
+			}
+		}
+		s.active++
+		if s.activeByAuthority == nil {
+			s.activeByAuthority = make(map[string]int)
+		}
+		s.activeByAuthority[authority]++
+		t, timeout := s.transport, s.timeout
+		s.mu.Unlock()
+		return t, timeout, nil
+	}
+}
+
+func (s *sharedHTTP3) release(authority string) {
+	s.mu.Lock()
+	s.active--
+	s.activeByAuthority[authority]--
+	if s.activeByAuthority[authority] == 0 {
+		delete(s.activeByAuthority, authority)
+		for cancel, dialAuthority := range s.dials {
+			if dialAuthority == authority {
+				(*cancel)()
+			}
+		}
+	}
+	idle := s.active == 0 && s.idlePending
+	s.mu.Unlock()
+	if idle {
+		s.CloseIdleConnections()
+	}
+}
+
+func (s *sharedHTTP3) CloseIdleConnections() {
+	s.mu.Lock()
+	if s.closed || s.transport == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.idlePending = true
+	if s.active != 0 || s.idleDone != nil {
+		s.mu.Unlock()
+		return
+	}
+	s.idlePending = false
+	done := make(chan struct{})
+	s.idleDone = done
+	t := s.transport
+	s.mu.Unlock()
+	t.CloseIdleConnections()
+	s.mu.Lock()
+	s.idleDone = nil
+	close(done)
+	s.mu.Unlock()
+}
+
+func (s *sharedHTTP3) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		done := s.closeDone
+		s.mu.Unlock()
+		<-done
+		return s.closeErr
+	}
+	s.closed = true
+	s.closeDone = make(chan struct{})
+	t := s.transport
+	for cancel := range s.dials {
+		(*cancel)()
+	}
+	s.mu.Unlock()
+	var err error
+	if t != nil {
+		err = t.Close()
+	}
+	s.mu.Lock()
+	s.closeErr = err
+	close(s.closeDone)
+	s.mu.Unlock()
+	return err
+}
+
+type http3StreamBody struct {
+	io.ReadCloser
+	release     func()
+	releaseOnce sync.Once
+	closeOnce   sync.Once
+	closeErr    error
+}
+
+func (b *http3StreamBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.releaseOnce.Do(b.release)
+	}
+	return n, err
+}
+func (b *http3StreamBody) Close() error {
+	b.closeOnce.Do(func() { b.closeErr = b.ReadCloser.Close(); b.releaseOnce.Do(b.release) })
 	return b.closeErr
 }
 
-// HTTP3Transport represents an HTTP/3 transport with customizable settings
+func (s *sharedHTTP3) roundTrip(req *http.Request, build func() (*http3.Transport, time.Duration)) (*http.Response, error) {
+	// Match quic-go's authority key, including default ports and IDNA names,
+	// so requests for one origin cannot retain another origin's abandoned dial.
+	authority := ""
+	if req.URL != nil {
+		host, port := req.URL.Hostname(), req.URL.Port()
+		if ascii, err := idna.ToASCII(host); err == nil {
+			host = ascii
+		}
+		if port == "" {
+			port = "443"
+		}
+		authority = net.JoinHostPort(host, port)
+	}
+	t, timeout, err := s.acquire(req.Context(), authority, build)
+	if err != nil {
+		if req.Body != nil {
+			req.Body.Close()
+		}
+		return nil, err
+	}
+	ctx := req.Context()
+	cancel := func() {}
+	if timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+	}
+	finish := func() { cancel(); s.release(authority) }
+	stdReq := (&stdhttp.Request{
+		Method: req.Method, URL: req.URL, Proto: req.Proto, ProtoMajor: req.ProtoMajor, ProtoMinor: req.ProtoMinor,
+		Header: ConvertFhttpHeader(req.Header), Body: req.Body, GetBody: req.GetBody, ContentLength: req.ContentLength,
+		TransferEncoding: req.TransferEncoding, Close: req.Close, Host: req.Host, Form: req.Form, PostForm: req.PostForm,
+		MultipartForm: req.MultipartForm, Trailer: ConvertFhttpHeader(req.Trailer), RemoteAddr: req.RemoteAddr,
+		RequestURI: req.RequestURI, Cancel: req.Cancel,
+	}).WithContext(ctx)
+	// fhttp's header-order metadata is not an HTTP header.
+	delete(stdReq.Header, http.HeaderOrderKey)
+	delete(stdReq.Header, http.PHeaderOrderKey)
+	resp, err := t.RoundTrip(stdReq)
+	// quic-go reports a previous, canceled handshake once while evicting its
+	// failed connection entry. A live request may retry that pre-stream failure;
+	// request bodies must be replayable because RoundTrip closed the first body.
+	if errors.Is(err, context.Canceled) && ctx.Err() == nil {
+		retry := stdReq.Body == nil || stdReq.Body == http.NoBody || stdReq.Body == stdhttp.NoBody
+		if !retry && stdReq.GetBody != nil {
+			stdReq.Body, err = stdReq.GetBody()
+			retry = err == nil
+		}
+		if retry {
+			resp, err = t.RoundTrip(stdReq)
+		}
+	}
+	if err != nil {
+		finish()
+		return nil, err
+	}
+	return &http.Response{
+		Status: resp.Status, StatusCode: resp.StatusCode, Proto: resp.Proto, ProtoMajor: resp.ProtoMajor, ProtoMinor: resp.ProtoMinor,
+		Header: ConvertHttpHeader(resp.Header), Body: &http3StreamBody{ReadCloser: resp.Body, release: finish},
+		ContentLength: resp.ContentLength, TransferEncoding: resp.TransferEncoding, Close: resp.Close,
+		Uncompressed: resp.Uncompressed, Trailer: ConvertHttpHeader(resp.Trailer), Request: req,
+	}, nil
+}
+
+// HTTP3Transport represents an HTTP/3 transport with customizable settings.
+// Set fields before first use. Close releases its shared connections.
 type HTTP3Transport struct {
-	// QuicConfig is the QUIC configuration
-	QuicConfig *quic.Config
-
-	// TLSClientConfig is the TLS configuration
-	TLSClientConfig *tls.Config
-
-	// UQuic integration fields
-	UQuicConfig *uquic.Config
-	QUICSpec    *uquic.QUICSpec
-	UseUQuic    bool // Enable uquic-based transport when QUIC fingerprint is provided
-
-	// MaxIdleConns controls the maximum number of idle connections
-	MaxIdleConns int
-
-	// IdleConnTimeout is the maximum amount of time a connection may be idle
-	IdleConnTimeout time.Duration
-
-	// ResponseHeaderTimeout is the amount of time to wait for a server's response headers
+	QuicConfig            *quic.Config
+	TLSClientConfig       *tls.Config
+	UQuicConfig           *uquic.Config
+	QUICSpec              *uquic.QUICSpec
+	UseUQuic              bool
+	MaxIdleConns          int
+	IdleConnTimeout       time.Duration
 	ResponseHeaderTimeout time.Duration
-
-	// DialTimeout is the maximum amount of time a dial will wait for a connect to complete
-	DialTimeout time.Duration
-
-	// ForceAttemptHTTP2 specifies whether HTTP/2 should be attempted
-	ForceAttemptHTTP2 bool
-
-	// DisableCompression, if true, prevents the Transport from
-	// requesting compression with an "Accept-Encoding: gzip"
-	DisableCompression bool
+	DialTimeout           time.Duration
+	ForceAttemptHTTP2     bool
+	DisableCompression    bool
+	shared                sharedHTTP3
 }
 
-// NewHTTP3Transport creates a new HTTP/3 transport
+func defaultHTTP3Config() *quic.Config {
+	return &quic.Config{HandshakeIdleTimeout: 30 * time.Second, MaxIdleTimeout: 90 * time.Second, KeepAlivePeriod: 15 * time.Second}
+}
 func NewHTTP3Transport(tlsConfig *tls.Config) *HTTP3Transport {
-	return &HTTP3Transport{
-		TLSClientConfig: tlsConfig,
-		QuicConfig: &quic.Config{
-			HandshakeIdleTimeout: 30 * time.Second,
-			MaxIdleTimeout:       90 * time.Second,
-			KeepAlivePeriod:      15 * time.Second,
-		},
-		UQuicConfig:           nil, // Will be set when QUIC fingerprint is provided
-		QUICSpec:              nil, // Will be set when QUIC fingerprint is provided
-		UseUQuic:              false,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: 10 * time.Second,
-		DialTimeout:           30 * time.Second,
-		DisableCompression:    false,
-	}
+	return &HTTP3Transport{TLSClientConfig: tlsConfig, QuicConfig: defaultHTTP3Config(), MaxIdleConns: 100, IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 10 * time.Second, DialTimeout: 30 * time.Second}
 }
-
-// NewHTTP3TransportWithUQuic creates a new HTTP/3 transport with UQuic fingerprinting support
 func NewHTTP3TransportWithUQuic(tlsConfig *tls.Config, quicSpec *uquic.QUICSpec) *HTTP3Transport {
-	transport := NewHTTP3Transport(tlsConfig)
+	t := NewHTTP3Transport(tlsConfig)
 	if quicSpec != nil {
-		transport.QUICSpec = quicSpec
-		transport.UseUQuic = true
-		transport.UQuicConfig = &uquic.Config{}
+		t.QUICSpec = quicSpec
+		t.UseUQuic = true
+		t.UQuicConfig = &uquic.Config{}
 	}
-	return transport
+	return t
 }
-
-// UQuicHTTP3Transport implements HTTP/3 transport with UQuic fingerprinting
-type UQuicHTTP3Transport struct {
-	// TLSClientConfig is the TLS configuration
-	TLSClientConfig *tls.Config
-
-	// UQuicConfig is the UQuic configuration
-	UQuicConfig *uquic.Config
-
-	// QUICSpec is the QUIC specification for fingerprinting
-	QUICSpec *uquic.QUICSpec
-
-	// DialTimeout is the maximum amount of time a dial will wait for a connect to complete
-	DialTimeout time.Duration
-}
-
-// NewUQuicHTTP3Transport creates a new UQuic-based HTTP/3 transport
-func NewUQuicHTTP3Transport(tlsConfig *tls.Config, quicSpec *uquic.QUICSpec) *UQuicHTTP3Transport {
-	return &UQuicHTTP3Transport{
-		TLSClientConfig: tlsConfig,
-		UQuicConfig:     &uquic.Config{},
-		QUICSpec:        quicSpec,
-		DialTimeout:     30 * time.Second,
-	}
-}
-
-// RoundTrip implements the http.RoundTripper interface for UQuic transport
-func (t *UQuicHTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// For now, fall back to standard HTTP/3 transport since uquic integration
-	// requires more complex implementation that goes beyond the scope of this change.
-	// Future enhancement: Implement direct uquic HTTP/3 client integration
-
-	// Create standard HTTP/3 transport as fallback
-	h3Transport := &http3.Transport{
-		TLSClientConfig: t.TLSClientConfig,
-		QUICConfig: &quic.Config{
-			HandshakeIdleTimeout: 30 * time.Second,
-			MaxIdleTimeout:       90 * time.Second,
-			KeepAlivePeriod:      15 * time.Second,
-		},
-	}
-	client := &stdhttp.Client{
-		Transport: h3Transport,
-	}
-
-	// Convert fhttp.Request to net/http.Request for HTTP/3
-	stdReq := &stdhttp.Request{
-		Method:           req.Method,
-		URL:              req.URL,
-		Proto:            req.Proto,
-		ProtoMajor:       req.ProtoMajor,
-		ProtoMinor:       req.ProtoMinor,
-		Header:           ConvertFhttpHeader(req.Header),
-		Body:             req.Body,
-		GetBody:          req.GetBody,
-		ContentLength:    req.ContentLength,
-		TransferEncoding: req.TransferEncoding,
-		Close:            req.Close,
-		Host:             req.Host,
-		Form:             req.Form,
-		PostForm:         req.PostForm,
-		MultipartForm:    req.MultipartForm,
-		Trailer:          ConvertFhttpHeader(req.Trailer),
-		RemoteAddr:       req.RemoteAddr,
-		RequestURI:       req.RequestURI,
-		TLS:              nil, // TLS state conversion not needed for HTTP/3
-		Cancel:           req.Cancel,
-		Response:         nil,
-	}
-
-	// Create a context with timeout. The cancel func is tied to the response
-	// body: cancelling here would abort the stream before the caller reads it.
-	ctx, cancel := context.WithTimeout(req.Context(), t.DialTimeout)
-
-	// Create a new request with the context
-	newReq := stdReq.Clone(ctx)
-
-	// Perform the request using standard HTTP/3
-	// Uses standard HTTP/3 implementation (uquic integration available)
-	stdResp, err := client.Do(newReq)
-	if err != nil {
-		cancel()
-		_ = h3Transport.Close()
-		return nil, err
-	}
-
-	// Convert back to fhttp.Response
-	return &http.Response{
-		Status:           stdResp.Status,
-		StatusCode:       stdResp.StatusCode,
-		Proto:            stdResp.Proto,
-		ProtoMajor:       stdResp.ProtoMajor,
-		ProtoMinor:       stdResp.ProtoMinor,
-		Header:           ConvertHttpHeader(stdResp.Header),
-		Body:             newHTTP3OwnedBody(stdResp.Body, h3Transport, cancel),
-		ContentLength:    stdResp.ContentLength,
-		TransferEncoding: stdResp.TransferEncoding,
-		Close:            stdResp.Close,
-		Uncompressed:     stdResp.Uncompressed,
-		Trailer:          ConvertHttpHeader(stdResp.Trailer),
-		Request:          req,
-		TLS:              nil, // Will be set properly if needed
-	}, nil
-}
-
-// RoundTrip implements the http.RoundTripper interface
 func (t *HTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// If UQuic is enabled and we have a QUIC spec, use UQuic transport
-	if t.UseUQuic && t.QUICSpec != nil {
-		uquicTransport := &UQuicHTTP3Transport{
-			TLSClientConfig: t.TLSClientConfig,
-			UQuicConfig:     t.UQuicConfig,
-			QUICSpec:        t.QUICSpec,
-			DialTimeout:     t.DialTimeout,
-		}
-		return uquicTransport.RoundTrip(req)
-	}
-
-	// Convert fhttp.Request to net/http.Request for HTTP/3
-	stdReq := &stdhttp.Request{
-		Method:           req.Method,
-		URL:              req.URL,
-		Proto:            req.Proto,
-		ProtoMajor:       req.ProtoMajor,
-		ProtoMinor:       req.ProtoMinor,
-		Header:           ConvertFhttpHeader(req.Header),
-		Body:             req.Body,
-		GetBody:          req.GetBody,
-		ContentLength:    req.ContentLength,
-		TransferEncoding: req.TransferEncoding,
-		Close:            req.Close,
-		Host:             req.Host,
-		Form:             req.Form,
-		PostForm:         req.PostForm,
-		MultipartForm:    req.MultipartForm,
-		Trailer:          ConvertFhttpHeader(req.Trailer),
-		RemoteAddr:       req.RemoteAddr,
-		RequestURI:       req.RequestURI,
-		TLS:              nil, // TLS state conversion not needed for HTTP/3
-		Cancel:           req.Cancel,
-		Response:         nil,
-	}
-
-	// Create an HTTP/3 transport for this request
-	h3Transport := &http3.Transport{
-		TLSClientConfig: t.TLSClientConfig,
-		QUICConfig:      t.QuicConfig,
-	}
-	client := &stdhttp.Client{
-		Transport: h3Transport,
-	}
-
-	// Create a context with timeout. The cancel func is tied to the response
-	// body: cancelling here would abort the stream before the caller reads it.
-	ctx, cancel := context.WithTimeout(req.Context(), t.DialTimeout)
-
-	// Create a new request with the context
-	newReq := stdReq.Clone(ctx)
-
-	// Perform the request
-	stdResp, err := client.Do(newReq)
-	if err != nil {
-		cancel()
-		_ = h3Transport.Close()
-		return nil, err
-	}
-
-	// Convert back to fhttp.Response
-	return &http.Response{
-		Status:           stdResp.Status,
-		StatusCode:       stdResp.StatusCode,
-		Proto:            stdResp.Proto,
-		ProtoMajor:       stdResp.ProtoMajor,
-		ProtoMinor:       stdResp.ProtoMinor,
-		Header:           ConvertHttpHeader(stdResp.Header),
-		Body:             newHTTP3OwnedBody(stdResp.Body, h3Transport, cancel),
-		ContentLength:    stdResp.ContentLength,
-		TransferEncoding: stdResp.TransferEncoding,
-		Close:            stdResp.Close,
-		Uncompressed:     stdResp.Uncompressed,
-		Trailer:          ConvertHttpHeader(stdResp.Trailer),
-		Request:          req,
-		TLS:              nil, // Will be set properly if needed
-	}, nil
+	return t.shared.roundTrip(req, func() (*http3.Transport, time.Duration) {
+		// UQuic requests retain the existing standard HTTP/3 fallback. Native QUIC
+		// fingerprint application is not implemented by this adapter.
+		return &http3.Transport{TLSClientConfig: t.TLSClientConfig, QUICConfig: t.QuicConfig, DisableCompression: t.DisableCompression}, t.DialTimeout
+	})
 }
+func (t *HTTP3Transport) Close() error          { return t.shared.Close() }
+func (t *HTTP3Transport) CloseIdleConnections() { t.shared.CloseIdleConnections() }
 
-// ConfigureHTTP3Client configures an http.Client to use HTTP/3
-func ConfigureHTTP3Client(client *stdhttp.Client, tlsConfig *tls.Config) {
-	client.Transport = &http3.Transport{
-		TLSClientConfig: tlsConfig,
-		QUICConfig: &quic.Config{
-			HandshakeIdleTimeout: 30 * time.Second,
-			MaxIdleTimeout:       90 * time.Second,
-			KeepAlivePeriod:      15 * time.Second,
-		},
-	}
-}
-
-// HTTP3RoundTripper implements an HTTP/3 round tripper with support for custom TLS fingerprints
-type HTTP3RoundTripper struct {
-	// TLSClientConfig is the TLS configuration
+// UQuicHTTP3Transport currently uses the standard HTTP/3 implementation as a
+// fallback. QUICSpec is retained for compatibility; it is not applied on wire.
+type UQuicHTTP3Transport struct {
 	TLSClientConfig *tls.Config
-
-	// QuicConfig is the QUIC configuration
-	QuicConfig *quic.Config
-
-	// Forwarder is the underlying HTTP/3 transport
-	Forwarder *http3.Transport
-
-	// Dialer is the custom dialer for HTTP/3 connections
-	Dialer func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error)
+	UQuicConfig     *uquic.Config
+	QUICSpec        *uquic.QUICSpec
+	DialTimeout     time.Duration
+	shared          sharedHTTP3
 }
 
-// NewHTTP3RoundTripper creates a new HTTP/3 round tripper with custom fingerprinting
+func NewUQuicHTTP3Transport(tlsConfig *tls.Config, quicSpec *uquic.QUICSpec) *UQuicHTTP3Transport {
+	return &UQuicHTTP3Transport{TLSClientConfig: tlsConfig, UQuicConfig: &uquic.Config{}, QUICSpec: quicSpec, DialTimeout: 30 * time.Second}
+}
+func (t *UQuicHTTP3Transport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.shared.roundTrip(req, func() (*http3.Transport, time.Duration) {
+		return &http3.Transport{TLSClientConfig: t.TLSClientConfig, QUICConfig: defaultHTTP3Config()}, t.DialTimeout
+	})
+}
+func (t *UQuicHTTP3Transport) Close() error          { return t.shared.Close() }
+func (t *UQuicHTTP3Transport) CloseIdleConnections() { t.shared.CloseIdleConnections() }
+
+func ConfigureHTTP3Client(client *stdhttp.Client, tlsConfig *tls.Config) {
+	client.Transport = &http3.Transport{TLSClientConfig: tlsConfig, QUICConfig: defaultHTTP3Config()}
+}
+
+// HTTP3RoundTripper shares one transport, including when Dialer is supplied.
+// Configuration and Forwarder must not be changed after first use.
+type HTTP3RoundTripper struct {
+	TLSClientConfig *tls.Config
+	QuicConfig      *quic.Config
+	Forwarder       *http3.Transport
+	Dialer          func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error)
+	shared          sharedHTTP3
+}
+
 func NewHTTP3RoundTripper(tlsConfig *tls.Config, quicConfig *quic.Config) *HTTP3RoundTripper {
-	rt := &HTTP3RoundTripper{
-		TLSClientConfig: tlsConfig,
-		QuicConfig:      quicConfig,
-	}
-
-	// Create the forwarder with default dialer
-	rt.Forwarder = &http3.Transport{
-		TLSClientConfig: tlsConfig,
-		QUICConfig:      quicConfig,
-	}
-
-	return rt
+	return &HTTP3RoundTripper{TLSClientConfig: tlsConfig, QuicConfig: quicConfig, Forwarder: &http3.Transport{TLSClientConfig: tlsConfig, QUICConfig: quicConfig}}
 }
-
-// RoundTrip implements the http.RoundTripper interface
 func (rt *HTTP3RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Convert fhttp.Request to net/http.Request
-	stdReq := &stdhttp.Request{
-		Method:           req.Method,
-		URL:              req.URL,
-		Proto:            req.Proto,
-		ProtoMajor:       req.ProtoMajor,
-		ProtoMinor:       req.ProtoMinor,
-		Header:           ConvertFhttpHeader(req.Header),
-		Body:             req.Body,
-		GetBody:          req.GetBody,
-		ContentLength:    req.ContentLength,
-		TransferEncoding: req.TransferEncoding,
-		Close:            req.Close,
-		Host:             req.Host,
-		Form:             req.Form,
-		PostForm:         req.PostForm,
-		MultipartForm:    req.MultipartForm,
-		Trailer:          ConvertFhttpHeader(req.Trailer),
-		RemoteAddr:       req.RemoteAddr,
-		RequestURI:       req.RequestURI,
-		TLS:              nil, // TLS state conversion not needed for HTTP/3
-		Cancel:           req.Cancel,
-		Response:         nil,
-	}
-	stdReq = stdReq.WithContext(req.Context())
-
-	// Use the custom dialer if set, otherwise use the forwarder
-	if rt.Dialer != nil {
-		// Check if req.URL.Host includes a port
-		host := req.URL.Host
-		if _, _, err := net.SplitHostPort(host); err != nil {
-			// No port, add the default HTTPS port
-			host = fmt.Sprintf("%s:443", host)
+	return rt.shared.roundTrip(req, func() (*http3.Transport, time.Duration) {
+		t := rt.Forwarder
+		if t == nil {
+			t = &http3.Transport{}
 		}
-
-		// Create a custom HTTP/3 client with our dialer
-		customRT := &http3.Transport{
-			TLSClientConfig: rt.TLSClientConfig,
-			QUICConfig:      rt.QuicConfig,
-			Dial:            rt.Dialer,
+		if rt.TLSClientConfig != nil {
+			t.TLSClientConfig = rt.TLSClientConfig
 		}
-
-		stdResp, err := customRT.RoundTrip(stdReq)
-		if err != nil {
-			_ = customRT.Close()
-			return nil, err
+		if rt.QuicConfig != nil {
+			t.QUICConfig = rt.QuicConfig
 		}
+		if rt.Dialer != nil {
+			t.Dial = rt.Dialer
+		}
+		rt.Forwarder = t
+		return t, 0
+	})
+}
+func (rt *HTTP3RoundTripper) Close() error          { return rt.shared.Close() }
+func (rt *HTTP3RoundTripper) CloseIdleConnections() { rt.shared.CloseIdleConnections() }
 
-		// Convert back to fhttp.Response
-		return &http.Response{
-			Status:           stdResp.Status,
-			StatusCode:       stdResp.StatusCode,
-			Proto:            stdResp.Proto,
-			ProtoMajor:       stdResp.ProtoMajor,
-			ProtoMinor:       stdResp.ProtoMinor,
-			Header:           ConvertHttpHeader(stdResp.Header),
-			Body:             newHTTP3OwnedBody(stdResp.Body, customRT, nil),
-			ContentLength:    stdResp.ContentLength,
-			TransferEncoding: stdResp.TransferEncoding,
-			Close:            stdResp.Close,
-			Uncompressed:     stdResp.Uncompressed,
-			Trailer:          ConvertHttpHeader(stdResp.Trailer),
-			Request:          req,
-			TLS:              nil,
-		}, nil
-	}
-
-	// Use the default forwarder with conversion
-	stdResp, err := rt.Forwarder.RoundTrip(stdReq)
-	if err != nil {
+func (rt *roundTripper) roundTripHTTP3(req *http.Request) (*http.Response, error) {
+	bodyTransferred := false
+	defer func() {
+		if !bodyTransferred && req.Body != nil {
+			_ = req.Body.Close()
+		}
+	}()
+	if err := rt.LockContext(req.Context()); err != nil {
 		return nil, err
 	}
-
-	// Convert back to fhttp.Response
-	return &http.Response{
-		Status:           stdResp.Status,
-		StatusCode:       stdResp.StatusCode,
-		Proto:            stdResp.Proto,
-		ProtoMajor:       stdResp.ProtoMajor,
-		ProtoMinor:       stdResp.ProtoMinor,
-		Header:           ConvertHttpHeader(stdResp.Header),
-		Body:             stdResp.Body,
-		ContentLength:    stdResp.ContentLength,
-		TransferEncoding: stdResp.TransferEncoding,
-		Close:            stdResp.Close,
-		Uncompressed:     stdResp.Uncompressed,
-		Trailer:          ConvertHttpHeader(stdResp.Trailer),
-		Request:          req,
-		TLS:              nil,
-	}, nil
-}
-
-// Close releases the persistent forwarder's QUIC connections and UDP socket.
-func (rt *HTTP3RoundTripper) Close() error {
-	return rt.Forwarder.Close()
-}
-
-func (rt *HTTP3RoundTripper) CloseIdleConnections() {
-	rt.Forwarder.CloseIdleConnections()
+	if rt.closed {
+		rt.Unlock()
+		return nil, net.ErrClosed
+	}
+	// HTTP CONNECT and SOCKS dialers cannot carry QUIC's UDP traffic. Never
+	// silently bypass a configured proxy with a direct QUIC connection.
+	if rt.dialer != nil && rt.dialer != proxy.Direct {
+		rt.Unlock()
+		return nil, fmt.Errorf("HTTP/3 proxy or custom TCP dialer is not supported")
+	}
+	if rt.http3Transport == nil {
+		tlsCfg := ConvertUtlsConfig(rt.TLSConfig)
+		if tlsCfg == nil {
+			tlsCfg = &tls.Config{}
+		} else {
+			tlsCfg = tlsCfg.Clone()
+		}
+		tlsCfg.InsecureSkipVerify = rt.InsecureSkipVerify
+		tlsCfg.NextProtos = []string{http3.NextProtoH3}
+		h3 := NewHTTP3RoundTripper(tlsCfg, defaultHTTP3Config())
+		requestIP := rt.RequestIP
+		h3.Dialer = func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
+			target := addr
+			if requestIP != "" {
+				_, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				target = net.JoinHostPort(requestIP, port)
+			}
+			conn, err := quic.DialAddrEarly(ctx, target, tlsCfg, cfg)
+			if err == nil {
+				host, _, splitErr := net.SplitHostPort(conn.RemoteAddr().String())
+				if splitErr == nil {
+					rt.setResolvedIP(addr, host)
+				}
+			}
+			return conn, err
+		}
+		rt.http3Transport = h3
+	}
+	h3 := rt.http3Transport
+	rt.Unlock()
+	bodyTransferred = true
+	return h3.RoundTrip(req)
 }
 
 // HTTP3Connection represents an HTTP/3 connection with associated metadata
@@ -459,194 +428,4 @@ func (c *HTTP3Connection) Close() error {
 		}
 	}
 	return err
-}
-
-// http3Dial establishes a UDP connection for HTTP/3 with proxy support
-func (rt *roundTripper) http3Dial(ctx context.Context, remoteAddr, port string, proxys ...string) (net.PacketConn, error) {
-	// If proxies are provided, handle proxy dialing
-	if len(proxys) > 0 {
-		// For now, HTTP/3 proxy support is limited - most HTTP/3 connections are direct
-		// TODO: Implement proper CONNECT-UDP proxy support for HTTP/3
-		return nil, fmt.Errorf("HTTP/3 proxy support not yet implemented")
-	}
-
-	// Direct UDP connection
-	conn, err := net.ListenPacket("udp", "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to create UDP packet connection: %w", err)
-	}
-
-	return conn, nil
-}
-
-// ghttp3Dial performs standard HTTP/3 dialing using the standard QUIC implementation
-func (rt *roundTripper) ghttp3Dial(ctx context.Context, remoteAddr, port string, proxys ...string) (*HTTP3Connection, error) {
-	// Establish UDP connection
-	udpConn, err := rt.http3Dial(ctx, remoteAddr, port, proxys...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Configure TLS - use crypto/tls.Config for standard QUIC (matches reference implementation)
-	var tlsConfig *tls.Config
-	if rt.TLSConfig != nil {
-		// Convert from utls.Config to crypto/tls.Config for standard QUIC
-		converted := ConvertUtlsConfig(rt.TLSConfig)
-		if converted != nil {
-			tlsConfig = converted.Clone()
-		}
-	}
-	if tlsConfig == nil {
-		tlsConfig = &tls.Config{}
-	}
-	tlsConfig.NextProtos = []string{http3.NextProtoH3}
-	tlsConfig.ServerName = remoteAddr
-
-	// Resolve remote address
-	remoteHost := remoteAddr
-	if rt.RequestIP != "" {
-		remoteHost = rt.RequestIP
-	} else if net.ParseIP(remoteAddr) == nil {
-		// If remoteAddr is not an IP, resolve it
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", remoteAddr)
-		if err != nil {
-			udpConn.Close()
-			return nil, fmt.Errorf("failed to resolve host %s: %w", remoteAddr, err)
-		}
-		if len(ips) == 0 {
-			udpConn.Close()
-			return nil, fmt.Errorf("no IP addresses found for host %s", remoteAddr)
-		}
-		// Use the first IP address
-		remoteHost = ips[0].String()
-	}
-	rt.setResolvedIP(net.JoinHostPort(remoteAddr, port), remoteHost)
-
-	// Convert port to integer
-	portInt := 443
-	if port != "" {
-		if p, err := net.LookupPort("tcp", port); err == nil {
-			portInt = p
-		}
-	}
-
-	// Configure QUIC - conditional setup like reference implementation
-	var quicConfig *quic.Config
-	// TODO: Add support for rt.UquicConfig when it's available
-	// For now, use default QUIC config similar to reference behavior
-	if quicConfig == nil {
-		quicConfig = &quic.Config{
-			HandshakeIdleTimeout:           30 * time.Second,
-			MaxIdleTimeout:                 90 * time.Second,
-			KeepAlivePeriod:                15 * time.Second,
-			InitialStreamReceiveWindow:     512 * 1024,      // 512 KB
-			MaxStreamReceiveWindow:         2 * 1024 * 1024, // 2 MB
-			InitialConnectionReceiveWindow: 1024 * 1024,     // 1 MB
-			MaxConnectionReceiveWindow:     4 * 1024 * 1024, // 4 MB
-			MaxIncomingStreams:             100,
-			MaxIncomingUniStreams:          100,
-			EnableDatagrams:                false,
-			DisablePathMTUDiscovery:        false,
-			Allow0RTT:                      false, // Security consideration
-		}
-	}
-
-	// Establish QUIC connection
-	remoteUDPAddr := &net.UDPAddr{
-		IP:   net.ParseIP(remoteHost),
-		Port: portInt,
-	}
-
-	quicConn, err := quic.DialEarly(ctx, udpConn, remoteUDPAddr, tlsConfig, quicConfig)
-	if err != nil {
-		udpConn.Close()
-		return nil, fmt.Errorf("failed to establish QUIC connection: %w", err)
-	}
-
-	return &HTTP3Connection{
-		QuicConn: quicConn,
-		RawConn:  udpConn,
-		Proxys:   proxys,
-		IsUQuic:  false,
-	}, nil
-}
-
-// uhttp3Dial performs HTTP/3 dialing using UQuic for QUIC fingerprinting
-func (rt *roundTripper) uhttp3Dial(ctx context.Context, spec *uquic.QUICSpec, remoteAddr, port string, proxys ...string) (*HTTP3Connection, error) {
-	if rt.TLSConfig == nil {
-		return nil, fmt.Errorf("TLS config is required for UQuic HTTP/3")
-	}
-	// Establish UDP connection
-	udpConn, err := rt.http3Dial(ctx, remoteAddr, port, proxys...)
-	if err != nil {
-		return nil, err
-	}
-
-	// Configure TLS with uTLS config - use utls.Config directly (matches reference implementation)
-	tlsConfig := rt.TLSConfig.Clone()
-	tlsConfig.NextProtos = []string{http3.NextProtoH3}
-	tlsConfig.ServerName = remoteAddr
-
-	// Resolve remote address
-	remoteHost := remoteAddr
-	if rt.RequestIP != "" {
-		remoteHost = rt.RequestIP
-	} else if net.ParseIP(remoteAddr) == nil {
-		// If remoteAddr is not an IP, resolve it
-		ips, err := net.DefaultResolver.LookupIP(ctx, "ip", remoteAddr)
-		if err != nil {
-			udpConn.Close()
-			return nil, fmt.Errorf("failed to resolve host %s: %w", remoteAddr, err)
-		}
-		if len(ips) == 0 {
-			udpConn.Close()
-			return nil, fmt.Errorf("no IP addresses found for host %s", remoteAddr)
-		}
-		// Use the first IP address
-		remoteHost = ips[0].String()
-	}
-	rt.setResolvedIP(net.JoinHostPort(remoteAddr, port), remoteHost)
-
-	// Convert port to integer
-	portInt := 443
-	if port != "" {
-		if p, err := net.LookupPort("tcp", port); err == nil {
-			portInt = p
-		}
-	}
-
-	// Configure UQuic - conditional setup like reference implementation
-	var uquicConfig *uquic.Config
-	// TODO: Add support for rt.UquicConfig when it's available
-	// For now, use default UQuic config similar to reference behavior
-	if uquicConfig == nil {
-		uquicConfig = &uquic.Config{}
-	}
-
-	// Create UQuic transport
-	uTransport := &uquic.UTransport{
-		Transport: &uquic.Transport{
-			Conn: udpConn,
-		},
-		QUICSpec: spec,
-	}
-
-	// Establish QUIC connection with UQuic
-	remoteUDPAddr := &net.UDPAddr{
-		IP:   net.ParseIP(remoteHost),
-		Port: portInt,
-	}
-
-	quicConn, err := uTransport.DialEarly(ctx, remoteUDPAddr, tlsConfig, uquicConfig)
-	if err != nil {
-		udpConn.Close()
-		return nil, fmt.Errorf("failed to establish UQuic connection: %w", err)
-	}
-
-	return &HTTP3Connection{
-		QuicConn: quicConn,
-		RawConn:  udpConn,
-		Proxys:   proxys,
-		IsUQuic:  true,
-	}, nil
 }

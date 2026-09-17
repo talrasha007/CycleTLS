@@ -95,11 +95,11 @@ type Options struct {
 	TLS13AutoRetry bool `json:"tls13AutoRetry"` // Automatically retry with TLS 1.3 compatible curves (default: true)
 
 	// Connection reuse options
-	MaxIdleClients        int  `json:"maxIdleClients"`        // Maximum idle connections per host (default: 512)
+	MaxIdleClients        int  `json:"maxIdleClients"`        // Legacy per-config idle client limit; shared pooling retains at most one current client.
 	EnableConnectionReuse bool `json:"enableConnectionReuse"` // Enable connection reuse across requests (default: true)
 
 	Meta                string `json:"meta"`                // Arbitrary metadata for client connection pooling
-	MaxTotalRequests    int64  `json:"maxTotalRequests"`    // Maximum total requests per connection (default: unlimited)
+	MaxTotalRequests    int64  `json:"maxTotalRequests"`    // Maximum acquisitions per shared transport generation (0: unlimited).
 	MaxResponseBodySize int64  `json:"maxResponseBodySize"` // Maximum response body size in bytes (default: unlimited)
 }
 
@@ -193,12 +193,12 @@ func processRequest(request cycleTLSRequest, parents ...context.Context) (result
 
 	client, err := newClientWithReuse(
 		browser,
-		0,
+		int(request.Options.MaxTotalRequests),
 		request.Options.Timeout,
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
 		enableConnectionReuse,
-		"",
+		request.Options.Meta,
 		request.Options.Proxy,
 		request.Options.IP,
 	)
@@ -213,7 +213,7 @@ func processRequest(request cycleTLSRequest, parents ...context.Context) (result
 	} else {
 		bodyReader = strings.NewReader(request.Options.Body)
 	}
-	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
+	req, err := http.NewRequestWithContext(withRequestSettings(ctx, browser), strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -345,12 +345,12 @@ func dispatchHTTP3Request(request cycleTLSRequest, parents ...context.Context) (
 
 	client, err := newClientWithReuse(
 		browser,
-		0,
+		int(request.Options.MaxTotalRequests),
 		request.Options.Timeout,
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
 		enableConnectionReuse,
-		"",
+		request.Options.Meta,
 		request.Options.Proxy,
 		request.Options.IP,
 	)
@@ -365,7 +365,7 @@ func dispatchHTTP3Request(request cycleTLSRequest, parents ...context.Context) (
 	} else {
 		bodyReader = strings.NewReader(request.Options.Body)
 	}
-	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
+	req, err := http.NewRequestWithContext(withRequestSettings(ctx, browser), strings.ToUpper(request.Options.Method), request.Options.URL, bodyReader)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -433,12 +433,12 @@ func dispatchSSERequest(request cycleTLSRequest, parents ...context.Context) (re
 
 	client, err := newClientWithReuse(
 		browser,
-		0,
+		int(request.Options.MaxTotalRequests),
 		request.Options.Timeout,
 		request.Options.DisableRedirect,
 		request.Options.UserAgent,
 		enableConnectionReuse,
-		"",
+		request.Options.Meta,
 		request.Options.Proxy,
 		request.Options.IP,
 	)
@@ -456,7 +456,7 @@ func dispatchSSERequest(request cycleTLSRequest, parents ...context.Context) (re
 	sseClient := NewSSEClient(client, headers)
 
 	// Create a placeholder request for consistency
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, request.Options.URL, nil)
+	req, err := http.NewRequestWithContext(withRequestSettings(ctx, browser), http.MethodGet, request.Options.URL, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -644,30 +644,7 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 	}
 
 	defer finishActiveRequest(res.options.RequestID)
-
-	// Extract host from URL for connection reuse tracking
-	hostPort := responseResolvedIPAddr(res.options.Options.URL)
-
-	// On success, keep the connection for this host and return the client to
-	// the pool so it is actually reused. Otherwise close everything: a client
-	// that is neither pooled nor closed leaks its cached TLS connections.
-	keepAlive := false
-	defer func() {
-		transport, ok := res.client.Transport.(*roundTripper)
-		if !ok {
-			return
-		}
-		if keepAlive && res.options.Options.EnableConnectionReuse {
-			transport.closeIdleConnectionsExcept(hostPort)
-			maxIdle := res.options.Options.MaxIdleClients
-			if maxIdle <= 0 {
-				maxIdle = 512
-			}
-			pushBackClientToPool(maxIdle, &res.client, res.browser, res.options.Options.Timeout, res.options.Options.DisableRedirect, "", res.options.Options.Proxy, res.options.Options.IP)
-		} else {
-			transport.CloseIdleConnections()
-		}
-	}()
+	defer releaseClient(&res.client)
 
 	finalUrl := res.options.Options.URL
 
@@ -807,7 +784,6 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 						}
 					}
 					// Body fully consumed: connection is clean and safe to reuse
-					keepAlive = resp.StatusCode >= 200 && resp.StatusCode < 400
 					// EOF reached, exit the loop
 					break loop
 				}
@@ -861,13 +837,7 @@ func dispatcherAsync(res fullRequest, chanWrite chan []byte) {
 func dispatchSSEAsync(res fullRequest, chanWrite chan []byte) {
 	defer finishActiveRequest(res.options.RequestID)
 
-	// SSE clients are popped from the pool but never returned; close their
-	// cached connections when the stream ends so they don't leak.
-	defer func() {
-		if transport, ok := res.client.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections()
-		}
-	}()
+	defer releaseClient(&res.client)
 
 	// Connect to SSE endpoint
 	sseResp, err := res.sseClient.Connect(res.req.Context(), res.options.Options.URL)
@@ -1500,6 +1470,8 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		JA4r:                     options.Ja4r,
 		HTTP2Fingerprint:         options.HTTP2Fingerprint,
 		QUICFingerprint:          options.QUICFingerprint,
+		DisableGrease:            options.DisableGrease,
+		TLS13AutoRetry:           options.TLS13AutoRetry,
 		UserAgent:                options.UserAgent,
 		Cookies:                  options.Cookies,
 		InsecureSkipVerify:       options.InsecureSkipVerify,
@@ -1534,6 +1506,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	if err != nil {
 		return Response{}, err
 	}
+	defer releaseClient(httpClient)
 
 	// Create request using fhttp
 	var bodyReader io.Reader
@@ -1542,9 +1515,8 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	} else {
 		bodyReader = strings.NewReader(options.Body)
 	}
-	req, err := http.NewRequest(Method, URL, bodyReader)
+	req, err := http.NewRequestWithContext(withRequestSettings(context.Background(), browser), Method, URL, bodyReader)
 	if err != nil {
-		httpClient.CloseIdleConnections()
 		return Response{}, err
 	}
 
@@ -1565,11 +1537,6 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	// Make request
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		// The client is not returned to the pool on failure, so close its
-		// cached connections instead of leaking them.
-		if transport, ok := httpClient.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections()
-		}
 		parsedError := parseError(err)
 		return Response{
 			Status: parsedError.StatusCode,
@@ -1577,21 +1544,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		}, nil
 	}
 
-	defer func() {
-		resp.Body.Close()
-		if transport, ok := httpClient.Transport.(*roundTripper); ok {
-			if enableConnectionReuse && (options.MaxTotalRequests <= 0 || transport.TotalRequests < options.MaxTotalRequests) && resp.StatusCode >= 200 && resp.StatusCode < 400 {
-				maxIdle := options.MaxIdleClients
-				if maxIdle <= 0 {
-					maxIdle = 512
-				}
-				pushBackClientToPool(maxIdle, httpClient, browser, options.Timeout, options.DisableRedirect, options.Meta, options.Proxy, options.IP)
-			} else {
-				transport.TotalRequests = 0
-				transport.CloseIdleConnections() // Close all idle connections
-			}
-		}
-	}()
+	defer resp.Body.Close()
 
 	var bodyBytes []byte
 	if options.MaxResponseBodySize < 0 {

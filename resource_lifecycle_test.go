@@ -276,6 +276,8 @@ func TestBrowserSSECloseReleasesTransport(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Close()
+	// Shared clients release their lease at stream close; eviction owns sockets.
+	CleanupClientPool(-time.Nanosecond)
 	awaitClosed(t, closed)
 }
 
@@ -405,7 +407,7 @@ func TestWebSocketUpgradeCancellation(t *testing.T) {
 	awaitClosed(t, done)
 }
 
-func TestHTTP3CustomResponseCloseReleasesConnection(t *testing.T) {
+func TestHTTP3CustomTransportCloseReleasesConnection(t *testing.T) {
 	certServer := httptest.NewTLSServer(stdhttp.HandlerFunc(func(stdhttp.ResponseWriter, *stdhttp.Request) {}))
 	tlsConfig := certServer.TLS.Clone()
 	certServer.Close()
@@ -437,6 +439,14 @@ func TestHTTP3CustomResponseCloseReleasesConnection(t *testing.T) {
 	case peer = <-serverConns:
 	case <-time.After(lifecycleTestTimeout):
 		t.Fatal("missing QUIC connection")
+	}
+	select {
+	case <-peer.Context().Done():
+		t.Fatal("closing a response closed the shared QUIC connection")
+	default:
+	}
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
 	}
 	awaitClosed(t, peer.Context().Done())
 }

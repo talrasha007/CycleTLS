@@ -18,9 +18,14 @@ import (
 
 // ClientPoolEntry represents a cached client with metadata
 type ClientPoolEntry struct {
-	Clients   []*fhttp.Client
-	CreatedAt time.Time
-	LastUsed  time.Time
+	Clients     []*fhttp.Client
+	CreatedAt   time.Time
+	LastUsed    time.Time
+	key         string
+	active      int
+	requests    int64
+	maxRequests int64
+	retired     bool
 }
 
 // Global client pool with metadata
@@ -157,42 +162,21 @@ func NewTransportWithProxy(ja3 string, useragent string, proxy proxy.ContextDial
 
 // generateClientKey creates a unique key for client pooling based on browser configuration
 func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP string) string {
-	// Create cookie signature for the key
-	cookieStr := ""
-	for _, cookie := range browser.Cookies {
-		cookieStr += fmt.Sprintf("|cookie:%s=%s", cookie.Name, cookie.Value)
+	// Include connection settings. Request headers are applied per request.
+	// Pointer-based extension
+	// callbacks/configs use identity: distinct custom configurations must never
+	// accidentally share. Metadata namespaces a pool; it cannot override TLS.
+	if timeout == 0 {
+		timeout = 15
 	}
-
-	// Create a hash of the configuration that affects connection behavior
-	ua := browser.UserAgent
-	ja3 := browser.JA3
-	ja4r := browser.JA4r
-
-	if len(meta) > 0 {
-		ua = meta
-		ja3 = meta
-		ja4r = meta
-	}
-
-	configStr := fmt.Sprintf("ja3:%s|ja4r:%s|http2:%s|quic:%s|ua:%s|proxy:%s|ip:%s|timeout:%d|redirect:%t|skipverify:%t|forcehttp1:%t|forcehttp3:%t%s",
-		ja3,
-		ja4r,
-		browser.HTTP2Fingerprint,
-		browser.QUICFingerprint,
-		ua,
-		proxyURL,
-		requestIP,
-		timeout,
-		disableRedirect,
-		browser.InsecureSkipVerify,
-		browser.ForceHTTP1,
-		browser.ForceHTTP3,
-		cookieStr,
-	)
-
-	// Generate SHA256 hash for the key
+	config := browser
+	config.client = nil
+	config.UserAgent = ""
+	config.Cookies = nil
+	config.HeaderOrder = nil
+	configStr := fmt.Sprintf("%#v|timeout:%d|redirect:%t|meta:%q|proxy:%q|ip:%q", config, timeout, disableRedirect, meta, proxyURL, requestIP)
 	hash := sha256.Sum256([]byte(configStr))
-	return fmt.Sprintf("%x", hash[:16]) // Use first 16 bytes for shorter key
+	return fmt.Sprintf("%x", hash[:])
 }
 
 // getOrCreateClient retrieves a client from the pool or creates a new one
@@ -204,31 +188,77 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 		return createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
 	}
 
-	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxy, requestIP)
-
-	// Try to get existing client from pool
+	if maxTotalReq < 0 {
+		maxTotalReq = 0
+	}
+	clientKey := fmt.Sprintf("%s:%d", generateClientKey(browser, timeout, disableRedirect, meta, proxy, requestIP), maxTotalReq)
+	startClientPoolJanitor()
+	var oldClient *fhttp.Client
 	advancedClientPoolMutex.Lock()
-	defer advancedClientPoolMutex.Unlock()
 	if entry, exists := advancedClientPool[clientKey]; exists {
-		// Update last used time
-		if len(entry.Clients) > 0 {
+		if entry.maxRequests == 0 || entry.requests < entry.maxRequests {
+			entry.active++
+			entry.requests++
 			entry.LastUsed = time.Now()
 			client := entry.Clients[0]
-			entry.Clients[0] = nil
-			entry.Clients = entry.Clients[1:]
-
-			client.Transport.(*roundTripper).TotalRequests++
+			advancedClientPoolMutex.Unlock()
 			return client, nil
 		}
+		entry.retired = true
+		delete(advancedClientPool, clientKey)
+		if entry.active == 0 {
+			oldClient = entry.Clients[0]
+		}
 	}
-
-	// Create new client
 	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
-	if err != nil {
-		return client, err
+	if err == nil {
+		now := time.Now()
+		entry := &ClientPoolEntry{Clients: []*fhttp.Client{client}, CreatedAt: now, LastUsed: now, key: clientKey, active: 1, requests: 1, maxRequests: int64(maxTotalReq)}
+		client.Transport.(*roundTripper).poolEntry = entry
+		advancedClientPool[clientKey] = entry
 	}
-	client.Transport.(*roundTripper).TotalRequests++
-	return client, nil
+	advancedClientPoolMutex.Unlock()
+	if oldClient != nil {
+		closeClientTransport(oldClient)
+	}
+	return client, err
+}
+
+// releaseClient ends one acquisition, not one TCP/QUIC stream. All callers
+// must close the response body before release, including errors and SSE.
+func releaseClient(client *fhttp.Client) {
+	rt, ok := client.Transport.(*roundTripper)
+	if !ok {
+		client.CloseIdleConnections()
+		return
+	}
+	entry := rt.poolEntry
+	if entry == nil {
+		_ = rt.Close()
+		return
+	}
+	advancedClientPoolMutex.Lock()
+	entry.active--
+	entry.LastUsed = time.Now()
+	if entry.maxRequests > 0 && entry.requests >= entry.maxRequests {
+		entry.retired = true
+		if advancedClientPool[entry.key] == entry {
+			delete(advancedClientPool, entry.key)
+		}
+	}
+	closeNow := entry.retired && entry.active == 0
+	advancedClientPoolMutex.Unlock()
+	if closeNow {
+		_ = rt.Close()
+	}
+}
+
+func closeClientTransport(client *fhttp.Client) {
+	if closer, ok := client.Transport.(interface{ Close() error }); ok {
+		_ = closer.Close()
+	} else {
+		client.CloseIdleConnections()
+	}
 }
 
 // createNewClient creates a new HTTP client (internal function)
@@ -256,40 +286,37 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 
 // cleanupClientPool removes old unused clients from the pool
 func CleanupClientPool(maxAge time.Duration) {
+	var closing []*fhttp.Client
 	advancedClientPoolMutex.Lock()
-	defer advancedClientPoolMutex.Unlock()
-
 	now := time.Now()
 	for key, entry := range advancedClientPool {
-		if now.Sub(entry.LastUsed) > maxAge {
-			go func() {
-				for _, client := range entry.Clients {
-					if transport, ok := client.Transport.(*roundTripper); ok {
-						transport.CloseIdleConnections()
-					}
-				}
-			}()
+		if entry.active == 0 && now.Sub(entry.LastUsed) > maxAge {
+			entry.retired = true
+			closing = append(closing, entry.Clients...)
 			delete(advancedClientPool, key)
 		}
+	}
+	advancedClientPoolMutex.Unlock()
+	for _, client := range closing {
+		closeClientTransport(client)
 	}
 }
 
 // clearAllConnections clears all connections from the pool for test isolation
 func clearAllConnections() {
+	var closing []*fhttp.Client
 	advancedClientPoolMutex.Lock()
-	defer advancedClientPoolMutex.Unlock()
-
-	// Close all connections in the pool before clearing
 	for _, entry := range advancedClientPool {
-		for _, client := range entry.Clients {
-			if transport, ok := client.Transport.(*roundTripper); ok {
-				transport.CloseIdleConnections()
-			}
+		entry.retired = true
+		if entry.active == 0 {
+			closing = append(closing, entry.Clients...)
 		}
 	}
-
-	// Clear the entire pool
 	advancedClientPool = make(map[string]*ClientPoolEntry)
+	advancedClientPoolMutex.Unlock()
+	for _, client := range closing {
+		closeClientTransport(client)
+	}
 }
 
 // newClientWithReuse creates a new http client with configurable connection reuse
@@ -313,35 +340,6 @@ func startClientPoolJanitor() {
 	})
 }
 
-func pushBackClientToPool(maxIdle int, client *fhttp.Client, browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP ...string) {
-	startClientPoolJanitor()
-
-	_, requestIPValue := parseConnectionOptions(proxyURL, firstString(requestIP...))
-	clientKey := generateClientKey(browser, timeout, disableRedirect, meta, proxyURL, requestIPValue)
-
-	advancedClientPoolMutex.Lock()
-	defer advancedClientPoolMutex.Unlock()
-
-	entry, exists := advancedClientPool[clientKey]
-	if !exists {
-		entry = &ClientPoolEntry{
-			Clients:   []*fhttp.Client{},
-			CreatedAt: time.Now(),
-			LastUsed:  time.Now(),
-		}
-		advancedClientPool[clientKey] = entry
-	}
-
-	if len(entry.Clients) < maxIdle {
-		entry.Clients = append(entry.Clients, client)
-		entry.LastUsed = time.Now()
-	} else {
-		if transport, ok := client.Transport.(*roundTripper); ok {
-			transport.CloseIdleConnections()
-		}
-	}
-}
-
 func parseConnectionOptions(values ...string) (proxyURL string, requestIP string) {
 	if len(values) > 0 {
 		proxyURL = values[0]
@@ -350,13 +348,6 @@ func parseConnectionOptions(values ...string) (proxyURL string, requestIP string
 		requestIP = values[1]
 	}
 	return proxyURL, requestIP
-}
-
-func firstString(values ...string) string {
-	if len(values) == 0 {
-		return ""
-	}
-	return values[0]
 }
 
 // WebSocketConnect establishes a WebSocket connection
@@ -429,11 +420,11 @@ func (browser Browser) SSEConnect(ctx context.Context, urlStr string) (*SSERespo
 	sseClient := NewSSEClient(httpClient, headers)
 
 	// Connect to SSE endpoint
-	resp, err := sseClient.Connect(ctx, urlStr)
+	resp, err := sseClient.Connect(withRequestSettings(ctx, browser), urlStr)
 	if err != nil {
-		httpClient.CloseIdleConnections()
+		releaseClient(httpClient)
 		return nil, err
 	}
-	resp.onClose = httpClient.CloseIdleConnections
+	resp.onClose = func() { releaseClient(httpClient) }
 	return resp, nil
 }
