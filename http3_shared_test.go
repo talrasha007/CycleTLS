@@ -3,6 +3,7 @@ package cycletls
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -18,6 +19,41 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 )
+
+func TestHTTP3BodyReadPreservesContextError(t *testing.T) {
+	s := startSharedH3Server(t, stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		io.WriteString(w, "partial:")
+		w.(stdhttp.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	for _, deadline := range []bool{false, true} {
+		t.Run(fmt.Sprintf("deadline=%t", deadline), func(t *testing.T) {
+			rt := NewHTTP3RoundTripper(&tls.Config{InsecureSkipVerify: true}, nil)
+			defer rt.Close()
+			ctx, cancel := context.WithCancel(context.Background())
+			want := context.Canceled
+			if deadline {
+				cancel()
+				ctx, cancel = context.WithTimeout(context.Background(), 200*time.Millisecond)
+				want = context.DeadlineExceeded
+			}
+			defer cancel()
+			req, _ := fhttp.NewRequestWithContext(ctx, "GET", s.url, nil)
+			resp, err := rt.RoundTrip(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			if !deadline {
+				cancel()
+			}
+			_, err = io.ReadAll(resp.Body)
+			if !errors.Is(err, want) {
+				t.Fatalf("body read error=%v, want %v", err, want)
+			}
+		})
+	}
+}
 
 type sharedH3Server struct {
 	url         string

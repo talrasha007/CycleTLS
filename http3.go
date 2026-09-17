@@ -166,6 +166,7 @@ func (s *sharedHTTP3) Close() error {
 
 type http3StreamBody struct {
 	io.ReadCloser
+	ctx         context.Context
 	release     func()
 	releaseOnce sync.Once
 	closeOnce   sync.Once
@@ -175,6 +176,12 @@ type http3StreamBody struct {
 func (b *http3StreamBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	if err != nil {
+		// QUIC reports local stream cancellation for both deadline expiry and
+		// explicit cancellation. Preserve the request's cause before release
+		// cancels our own context, so callers can reliably classify timeouts.
+		if err != io.EOF && b.ctx.Err() != nil {
+			err = b.ctx.Err()
+		}
 		b.releaseOnce.Do(b.release)
 	}
 	return n, err
@@ -241,7 +248,7 @@ func (s *sharedHTTP3) roundTrip(req *http.Request, build func() (*http3.Transpor
 	}
 	return &http.Response{
 		Status: resp.Status, StatusCode: resp.StatusCode, Proto: resp.Proto, ProtoMajor: resp.ProtoMajor, ProtoMinor: resp.ProtoMinor,
-		Header: ConvertHttpHeader(resp.Header), Body: &http3StreamBody{ReadCloser: resp.Body, release: finish},
+		Header: ConvertHttpHeader(resp.Header), Body: &http3StreamBody{ReadCloser: resp.Body, ctx: ctx, release: finish},
 		ContentLength: resp.ContentLength, TransferEncoding: resp.TransferEncoding, Close: resp.Close,
 		Uncompressed: resp.Uncompressed, Trailer: ConvertHttpHeader(resp.Trailer), Request: req,
 	}, nil
