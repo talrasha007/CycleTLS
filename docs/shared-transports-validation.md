@@ -12,6 +12,12 @@ All network tests use local TLS/HTTP2 or real QUIC/HTTP3 servers.
   UserAgent, Cookies and HeaderOrder are excluded and applied from an immutable
   per-request context in synchronous, asynchronous and SSE paths. `Meta` is an
   additional namespace, not a compatibility override.
+- Pool keys use the original fingerprint options: `Ja3="RAND"` and
+  `SignatureAlgorithms="RAND"` remain literal policies in the key. Random values
+  and extension shuffling are resolved once when a new transport generation is
+  created, including when reuse is disabled. Reuse keeps that generation's
+  fingerprint; reaching `MaxTotalRequests` creates a new generation and resolves
+  the policies again. `ShuffleExtensions` itself participates in the key.
 - A reused connection retains its negotiated fingerprint. User-Agent can affect
   default handshake construction on initial connection creation; changing its
   request header does not renegotiate TLS. Use explicit fingerprint settings or

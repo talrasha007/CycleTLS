@@ -39,6 +39,7 @@ type Browser struct {
 	EnableClientSessionCache bool
 	PaddingExtension         *utls.UtlsPaddingExtension
 	SignatureAlgorithms      string
+	ShuffleExtensions        bool
 	JA3                      string
 	JA4r                     string // JA4 raw format with explicit cipher/extension values
 	HTTP2Fingerprint         string
@@ -281,7 +282,9 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 		dialer = proxy.Direct
 	}
 
-	return clientBuilder(browser, dialer, timeout, disableRedirect, requestIP), nil
+	// The registry key has already captured the caller's original options.
+	// Resolve random policies only when constructing a new generation.
+	return clientBuilder(resolveBrowserFingerprint(browser), dialer, timeout, disableRedirect, requestIP), nil
 }
 
 // cleanupClientPool removes old unused clients from the pool

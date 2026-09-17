@@ -239,6 +239,7 @@ func TestSharedPoolConfigurationIsolation(t *testing.T) {
 	}{
 		{"forceTLS12", func(b *Browser) { b.ForceTLS12 = true }},
 		{"sessionCache", func(b *Browser) { b.EnableClientSessionCache = true }},
+		{"shuffleExtensions", func(b *Browser) { b.ShuffleExtensions = true }},
 		{"signatureAlgorithms", func(b *Browser) { b.SignatureAlgorithms = "0403,0804" }},
 		{"JA3EvenWithMeta", func(b *Browser) { b.JA3 = "771,4865,0-43,29,0" }},
 	}
