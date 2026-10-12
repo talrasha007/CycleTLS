@@ -20,6 +20,14 @@ import (
 var errProtocolNegotiated = errors.New("protocol negotiated")
 var globalClientSessionCache = utls.NewLRUClientSessionCache(16384)
 
+type tlsHandshakeDoneKey struct{}
+
+func notifyTLSHandshakeDone(ctx context.Context) {
+	if callback, ok := ctx.Value(tlsHandshakeDoneKey{}).(func()); ok {
+		callback()
+	}
+}
+
 type roundTripper struct {
 	contextMutex
 
@@ -321,6 +329,7 @@ func (rt *roundTripper) dialTLSImpl(ctx context.Context, network, addr string) (
 	}
 
 	// If transport already exists, return connection
+	notifyTLSHandshakeDone(ctx)
 	if rt.cachedTransports[addr] != nil {
 		owned = false
 		return conn, nil
@@ -434,6 +443,7 @@ func (rt *roundTripper) retryWithTLS13CompatibleCurves(ctx context.Context, netw
 		_ = conn.Close()
 		return nil, fmt.Errorf("TLS 1.3 compatible handshake failed: %+v", err)
 	}
+	notifyTLSHandshakeDone(ctx)
 	if rt.cachedTransports[addr] != nil {
 		owned = false
 		return conn, nil
@@ -521,6 +531,7 @@ func (rt *roundTripper) retryWithOriginalTLS12JA3(ctx context.Context, network, 
 		_ = conn.Close()
 		return nil, fmt.Errorf("original TLS 1.2 handshake failed: %+v", err)
 	}
+	notifyTLSHandshakeDone(ctx)
 	if rt.cachedTransports[addr] != nil {
 		owned = false
 		return conn, nil

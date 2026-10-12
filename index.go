@@ -54,6 +54,12 @@ type Cookie struct {
 
 // Options sets CycleTLS client options
 type Options struct {
+	// TLSHandshakeDone runs synchronously after a successful TCP TLS handshake,
+	// before HTTP negotiation/requests. A reused connection performs no new
+	// handshake and does not notify. Disable reuse when probing individual IPs.
+	// The callback must return promptly and is not serialized to JSON.
+	TLSHandshakeDone func() `json:"-"`
+
 	URL       string            `json:"url"`
 	Method    string            `json:"method"`
 	Headers   map[string]string `json:"headers"`
@@ -1475,7 +1481,11 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	} else {
 		bodyReader = strings.NewReader(options.Body)
 	}
-	req, err := http.NewRequestWithContext(withRequestSettings(context.Background(), browser), Method, URL, bodyReader)
+	requestContext := context.Background()
+	if options.TLSHandshakeDone != nil {
+		requestContext = context.WithValue(requestContext, tlsHandshakeDoneKey{}, options.TLSHandshakeDone)
+	}
+	req, err := http.NewRequestWithContext(withRequestSettings(requestContext, browser), Method, URL, bodyReader)
 	if err != nil {
 		return Response{}, err
 	}
