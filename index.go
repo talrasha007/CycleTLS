@@ -82,7 +82,7 @@ type Options struct {
 
 	// Connection options
 	Proxy              string   `json:"proxy"`
-	IP                 string   `json:"ip"` // Direct connection target IP for this request. Ignored when Proxy is set.
+	IP                 string   `json:"ip"` // Connection target IP for this request, including through a proxy. Host and TLS SNI retain the URL hostname.
 	Cookies            []Cookie `json:"cookies"`
 	Timeout            int      `json:"timeout"`
 	DisableRedirect    bool     `json:"disableRedirect"`

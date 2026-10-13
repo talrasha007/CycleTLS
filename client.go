@@ -265,6 +265,9 @@ func closeClientTransport(client *fhttp.Client) {
 // createNewClient creates a new HTTP client (internal function)
 func createNewClient(browser Browser, timeout int, disableRedirect bool, userAgent string, proxyURL ...string) (*fhttp.Client, error) {
 	proxyURLValue, requestIP := parseConnectionOptions(proxyURL...)
+	if requestIP != "" && net.ParseIP(requestIP) == nil {
+		return nil, fmt.Errorf("invalid request IP: %s", requestIP)
+	}
 	var dialer proxy.ContextDialer
 	if proxyURLValue != "" {
 		var err error
@@ -276,9 +279,6 @@ func createNewClient(browser Browser, timeout int, disableRedirect bool, userAge
 			}, err
 		}
 	} else {
-		if requestIP != "" && net.ParseIP(requestIP) == nil {
-			return nil, fmt.Errorf("invalid request IP: %s", requestIP)
-		}
 		dialer = proxy.Direct
 	}
 
@@ -347,7 +347,7 @@ func parseConnectionOptions(values ...string) (proxyURL string, requestIP string
 	if len(values) > 0 {
 		proxyURL = values[0]
 	}
-	if len(values) > 1 && proxyURL == "" {
+	if len(values) > 1 {
 		requestIP = values[1]
 	}
 	return proxyURL, requestIP
