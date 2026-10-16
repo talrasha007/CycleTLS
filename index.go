@@ -1360,14 +1360,16 @@ func main() {
 
 // Backward compatibility types and functions for integration tests
 type Response struct {
-	RequestID  string            `json:"requestId"`
-	Status     int               `json:"status"`
-	Body       string            `json:"body"`
-	BodyBytes  []byte            `json:"bodyBytes"` // New field for binary response data
-	Headers    map[string]string `json:"headers"`
-	Cookies    []*nhttp.Cookie   `json:"cookies"`
-	FinalUrl   string            `json:"finalUrl"`
-	ResolvedIP string            `json:"resolvedIp"`
+	RequestID           string            `json:"requestId"`
+	Status              int               `json:"status"`
+	Body                string            `json:"body"`
+	BodyBytes           []byte            `json:"bodyBytes"` // New field for binary response data
+	Headers             map[string]string `json:"headers"`
+	Cookies             []*nhttp.Cookie   `json:"cookies"`
+	FinalUrl            string            `json:"finalUrl"`
+	ResolvedIP          string            `json:"resolvedIp"`
+	Ja3                 string            `json:"ja3"`                 // Actual TCP TLS ClientHello JA3 string, excluding GREASE; empty without a TLS response.
+	SignatureAlgorithms string            `json:"signatureAlgorithms"` // Actual signature_algorithms order as comma-separated hexadecimal IDs.
 }
 
 // JSONBody parses the response body as JSON
@@ -1579,13 +1581,16 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		netCookies = append(netCookies, netCookie)
 	}
 
+	fingerprint := responseTLSFingerprint(resp)
 	return Response{
-		Status:     resp.StatusCode,
-		Body:       string(bodyBytes),
-		BodyBytes:  bodyBytes, // Provide raw bytes for binary data
-		Headers:    headers,
-		Cookies:    netCookies,
-		FinalUrl:   finalUrl,
-		ResolvedIP: resolvedIP,
+		Ja3:                 fingerprint.ja3,
+		SignatureAlgorithms: fingerprint.signatureAlgorithms,
+		Status:              resp.StatusCode,
+		Body:                string(bodyBytes),
+		BodyBytes:           bodyBytes, // Provide raw bytes for binary data
+		Headers:             headers,
+		Cookies:             netCookies,
+		FinalUrl:            finalUrl,
+		ResolvedIP:          resolvedIP,
 	}, nil
 }

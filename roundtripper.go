@@ -153,7 +153,7 @@ func (rt *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	// Perform the request
 	// rt.TotalRequests++
-	return cached.RoundTrip(req)
+	return roundTripWithFingerprint(cached, req)
 }
 
 func (rt *roundTripper) GetCached(req *http.Request, addr string) (http.RoundTripper, error) {
