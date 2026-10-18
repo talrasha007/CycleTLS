@@ -82,7 +82,8 @@ type Options struct {
 
 	// Connection options
 	Proxy              string   `json:"proxy"`
-	IP                 string   `json:"ip"` // Connection target IP for this request, including through a proxy. Host and TLS SNI retain the URL hostname.
+	LocalIP            string   `json:"localIp"` // Local source IP or IPv6 CIDR; ignored for HTTP/3.
+	IP                 string   `json:"ip"`      // Connection target IP for this request, including through a proxy. Host and TLS SNI retain the URL hostname.
 	Cookies            []Cookie `json:"cookies"`
 	Timeout            int      `json:"timeout"`
 	DisableRedirect    bool     `json:"disableRedirect"`
@@ -207,6 +208,7 @@ func processRequest(request cycleTLSRequest, parents ...context.Context) (result
 		request.Options.Meta,
 		request.Options.Proxy,
 		request.Options.IP,
+		request.Options.LocalIP,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -360,6 +362,7 @@ func dispatchHTTP3Request(request cycleTLSRequest, parents ...context.Context) (
 		request.Options.Meta,
 		request.Options.Proxy,
 		request.Options.IP,
+		request.Options.LocalIP,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -449,6 +452,7 @@ func dispatchSSERequest(request cycleTLSRequest, parents ...context.Context) (re
 		request.Options.Meta,
 		request.Options.Proxy,
 		request.Options.IP,
+		request.Options.LocalIP,
 	)
 	if err != nil {
 		log.Fatal(err)
@@ -1360,6 +1364,7 @@ func main() {
 
 // Backward compatibility types and functions for integration tests
 type Response struct {
+	LocalIP             string            `json:"localIp"` // Actual local IP of the final TCP connection, including on reuse.
 	RequestID           string            `json:"requestId"`
 	Status              int               `json:"status"`
 	Body                string            `json:"body"`
@@ -1470,6 +1475,7 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		options.Meta,
 		options.Proxy,
 		options.IP,
+		options.LocalIP,
 	)
 	if err != nil {
 		return Response{}, err
@@ -1592,5 +1598,6 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		Cookies:             netCookies,
 		FinalUrl:            finalUrl,
 		ResolvedIP:          resolvedIP,
+		LocalIP:             responseLocalIP(resp),
 	}, nil
 }

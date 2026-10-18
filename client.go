@@ -162,7 +162,7 @@ func NewTransportWithProxy(ja3 string, useragent string, proxy proxy.ContextDial
 }
 
 // generateClientKey creates a unique key for client pooling based on browser configuration
-func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP string) string {
+func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta string, proxyURL string, requestIP string, localIP ...string) string {
 	// Include connection settings. Request headers are applied per request.
 	// Pointer-based extension
 	// callbacks/configs use identity: distinct custom configurations must never
@@ -175,7 +175,11 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 	config.UserAgent = ""
 	config.Cookies = nil
 	config.HeaderOrder = nil
-	configStr := fmt.Sprintf("%#v|timeout:%d|redirect:%t|meta:%q|proxy:%q|ip:%q", config, timeout, disableRedirect, meta, proxyURL, requestIP)
+	source := ""
+	if len(localIP) > 0 {
+		source = localIP[0]
+	}
+	configStr := fmt.Sprintf("%#v|timeout:%d|redirect:%t|meta:%q|proxy:%q|ip:%q|local:%q", config, timeout, disableRedirect, meta, proxyURL, requestIP, source)
 	hash := sha256.Sum256([]byte(configStr))
 	return fmt.Sprintf("%x", hash[:])
 }
@@ -183,16 +187,20 @@ func generateClientKey(browser Browser, timeout int, disableRedirect bool, meta 
 // getOrCreateClient retrieves a client from the pool or creates a new one
 func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRedirect bool, userAgent string, enableConnectionReuse bool, meta string, proxyURL ...string) (*fhttp.Client, error) {
 	proxy, requestIP := parseConnectionOptions(proxyURL...)
+	localIP, err := normalizeLocalIP(sourceConnectionOption(proxyURL), browser.ForceHTTP3)
+	if err != nil {
+		return nil, err
+	}
 
 	// If connection reuse is disabled, always create a new client
 	if !enableConnectionReuse {
-		return createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
+		return createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP, localIP)
 	}
 
 	if maxTotalReq < 0 {
 		maxTotalReq = 0
 	}
-	clientKey := fmt.Sprintf("%s:%d", generateClientKey(browser, timeout, disableRedirect, meta, proxy, requestIP), maxTotalReq)
+	clientKey := fmt.Sprintf("%s:%d", generateClientKey(browser, timeout, disableRedirect, meta, proxy, requestIP, localIP), maxTotalReq)
 	startClientPoolJanitor()
 	var oldClient *fhttp.Client
 	advancedClientPoolMutex.Lock()
@@ -211,7 +219,7 @@ func getOrCreateClient(browser Browser, maxTotalReq int, timeout int, disableRed
 			oldClient = entry.Clients[0]
 		}
 	}
-	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP)
+	client, err := createNewClient(browser, timeout, disableRedirect, userAgent, proxy, requestIP, localIP)
 	if err == nil {
 		now := time.Now()
 		entry := &ClientPoolEntry{Clients: []*fhttp.Client{client}, CreatedAt: now, LastUsed: now, key: clientKey, active: 1, requests: 1, maxRequests: int64(maxTotalReq)}
@@ -265,21 +273,30 @@ func closeClientTransport(client *fhttp.Client) {
 // createNewClient creates a new HTTP client (internal function)
 func createNewClient(browser Browser, timeout int, disableRedirect bool, userAgent string, proxyURL ...string) (*fhttp.Client, error) {
 	proxyURLValue, requestIP := parseConnectionOptions(proxyURL...)
+	localIP, err := normalizeLocalIP(sourceConnectionOption(proxyURL), browser.ForceHTTP3)
+	if err != nil {
+		return nil, err
+	}
 	if requestIP != "" && net.ParseIP(requestIP) == nil {
 		return nil, fmt.Errorf("invalid request IP: %s", requestIP)
 	}
-	var dialer proxy.ContextDialer
+	var dialer proxy.ContextDialer = proxy.Direct
+	if localIP != "" {
+		dialer = &localIPDialer{source: localIP}
+	}
 	if proxyURLValue != "" {
 		var err error
-		dialer, err = newConnectDialer(proxyURLValue, userAgent)
+		if localIP == "" {
+			dialer, err = newConnectDialer(proxyURLValue, userAgent)
+		} else {
+			dialer, err = newConnectDialer(proxyURLValue, userAgent, dialer)
+		}
 		if err != nil {
 			return &fhttp.Client{
 				Timeout:       time.Duration(timeout) * time.Second,
 				CheckRedirect: disabledRedirect,
 			}, err
 		}
-	} else {
-		dialer = proxy.Direct
 	}
 
 	// The registry key has already captured the caller's original options.
@@ -430,4 +447,11 @@ func (browser Browser) SSEConnect(ctx context.Context, urlStr string) (*SSERespo
 	}
 	resp.onClose = func() { releaseClient(httpClient) }
 	return resp, nil
+}
+
+func sourceConnectionOption(values []string) string {
+	if len(values) > 2 {
+		return values[2]
+	}
+	return ""
 }

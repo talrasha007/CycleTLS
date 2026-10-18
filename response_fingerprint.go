@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,7 @@ type tlsFingerprintKey struct{}
 func roundTripWithFingerprint(transport http.RoundTripper, req *http.Request) (*http.Response, error) {
 	var mu sync.Mutex
 	var fingerprint tlsFingerprint
+	var localIP string
 	ctx := httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
 			var f tlsFingerprint
@@ -33,6 +35,10 @@ func roundTripWithFingerprint(transport http.RoundTripper, req *http.Request) (*
 			}
 			mu.Lock()
 			fingerprint = f
+			localIP = ""
+			if info.Conn != nil && info.Conn.LocalAddr() != nil {
+				localIP, _, _ = net.SplitHostPort(info.Conn.LocalAddr().String())
+			}
 			mu.Unlock()
 		},
 	})
@@ -41,11 +47,14 @@ func roundTripWithFingerprint(transport http.RoundTripper, req *http.Request) (*
 	if resp != nil {
 		mu.Lock()
 		f := fingerprint
+		ip := localIP
 		mu.Unlock()
 		if resp.Request == nil {
 			resp.Request = req
 		}
-		resp.Request = resp.Request.WithContext(context.WithValue(resp.Request.Context(), tlsFingerprintKey{}, f))
+		ctx := context.WithValue(resp.Request.Context(), tlsFingerprintKey{}, f)
+		ctx = context.WithValue(ctx, localIPKey{}, ip)
+		resp.Request = resp.Request.WithContext(ctx)
 	}
 	return resp, err
 }

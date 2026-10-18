@@ -21,6 +21,7 @@ import (
 
 type SocksDialer struct {
 	proxyAddr string
+	forward   proxy.ContextDialer
 }
 
 func (d *SocksDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -39,7 +40,11 @@ func (d *SocksDialer) DialContext(ctx context.Context, network, addr string) (ne
 	if len(ips) == 0 {
 		return nil, fmt.Errorf("no IPv4 address for %s", host)
 	}
-	conn, err := (&net.Dialer{}).DialContext(ctx, network, d.proxyAddr)
+	forward := d.forward
+	if forward == nil {
+		forward = &net.Dialer{}
+	}
+	conn, err := forward.DialContext(ctx, network, d.proxyAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +146,12 @@ const maxProxyDialers = 1024
 // newConnectDialer creates a dialer to issue CONNECT requests and tunnel traffic via HTTP/S proxy.
 // proxyUrlStr must provide Scheme and Host, may provide credentials and port.
 // Example: https://username:password@golang.org:443
-func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer, error) {
+func newConnectDialer(proxyURLStr string, UserAgent string, forwards ...proxy.ContextDialer) (proxy.ContextDialer, error) {
+	var base proxy.ContextDialer = &net.Dialer{}
+	customSource := len(forwards) > 0
+	if customSource {
+		base = forwards[0]
+	}
 	proxyURL, err := url.Parse(proxyURLStr)
 	if err != nil {
 		return nil, err
@@ -172,7 +182,7 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 		ProxyDialersMu.Lock()
 		defer ProxyDialersMu.Unlock()
 
-		if cachedDialer, ok := ProxyDialers[proxyURLStr]; ok {
+		if cachedDialer, ok := ProxyDialers[proxyURLStr]; ok && !customSource {
 			contextDialer = *cachedDialer
 		} else {
 			var auth *proxy.Auth
@@ -183,21 +193,20 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 					auth = &proxy.Auth{User: username, Password: password}
 				}
 			}
-			var forward proxy.Dialer
-			if proxyURL.Scheme == "socks5h" {
-				forward = proxy.Direct
-			}
+			forward := &contextForwardDialer{ContextDialer: base}
 			dialSocksProxy, err := proxy.SOCKS5("tcp", proxyURL.Host, auth, forward)
 			if err != nil {
 				return nil, fmt.Errorf("Error creating SOCKS5 proxy, reason %s", err)
 			}
 			if cd, ok := dialSocksProxy.(proxy.ContextDialer); ok {
 				contextDialer = cd
-				if len(ProxyDialers) >= maxProxyDialers {
+				if !customSource && len(ProxyDialers) >= maxProxyDialers {
 					// Dialers hold no open resources, so dropping the cache is safe
 					ProxyDialers = make(map[string]*proxy.ContextDialer)
 				}
-				ProxyDialers[proxyURLStr] = &contextDialer
+				if !customSource {
+					ProxyDialers[proxyURLStr] = &contextDialer
+				}
 			} else {
 				return nil, errors.New("failed type assertion to DialContext")
 			}
@@ -207,7 +216,7 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 		return client, nil
 	case "socks4":
 		var dialer *SocksDialer
-		dialer = &SocksDialer{proxyAddr: proxyURL.Host}
+		dialer = &SocksDialer{proxyAddr: proxyURL.Host, forward: base}
 		client.Dialer = dialer
 		client.DefaultHeader.Set("User-Agent", UserAgent)
 		return client, nil
@@ -217,7 +226,7 @@ func newConnectDialer(proxyURLStr string, UserAgent string) (proxy.ContextDialer
 		return nil, errors.New("scheme " + proxyURL.Scheme + " is not supported")
 	}
 
-	client.Dialer = &net.Dialer{}
+	client.Dialer = base
 
 	if proxyURL.User != nil {
 		if proxyURL.User.Username() != "" {
@@ -516,4 +525,11 @@ func (h *http2Conn) CloseWrite() error {
 
 func (h *http2Conn) CloseRead() error {
 	return h.out.Close()
+}
+
+// Adapt context-aware forwarding dialers for the SOCKS constructor.
+type contextForwardDialer struct{ proxy.ContextDialer }
+
+func (d *contextForwardDialer) Dial(network, addr string) (net.Conn, error) {
+	return d.DialContext(context.Background(), network, addr)
 }
