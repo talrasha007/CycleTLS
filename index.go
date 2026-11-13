@@ -1431,10 +1431,9 @@ func (client CycleTLS) Close() {
 	clearAllConnections()
 }
 
-// Do creates a single HTTP request for integration tests
-func (client CycleTLS) Do(URL string, options Options, Method string) (Response, error) {
-	// Create browser from options
-	browser := Browser{
+// browserFromOptions selects the transport and request defaults from Options.
+func browserFromOptions(options Options) Browser {
+	return Browser{
 		PaddingExtension:         options.PaddingExtension,
 		EnableClientSessionCache: options.EnableClientSessionCache,
 		SignatureAlgorithms:      options.SignatureAlgorithms,
@@ -1453,6 +1452,11 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 		ForceHTTP3:               options.ForceHTTP3,
 		HeaderOrder:              options.HeaderOrder,
 	}
+}
+
+// Do creates a single HTTP request for integration tests
+func (client CycleTLS) Do(URL string, options Options, Method string) (Response, error) {
+	browser := browserFromOptions(options)
 
 	// Note: Don't automatically set HeaderOrder from UserAgent here as it can interfere with connection management
 	// The pseudo-header order should be set through explicit HTTP2Fingerprint or Options.HeaderOrder
@@ -1482,6 +1486,10 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	}
 	defer releaseClient(httpClient)
 
+	return doClientRequest(context.Background(), httpClient, browser, URL, options, Method)
+}
+
+func doClientRequest(requestContext context.Context, httpClient *http.Client, browser Browser, URL string, options Options, Method string) (Response, error) {
 	// Create request using fhttp
 	var bodyReader io.Reader
 	if len(options.BodyBytes) > 0 {
@@ -1489,7 +1497,6 @@ func (client CycleTLS) Do(URL string, options Options, Method string) (Response,
 	} else {
 		bodyReader = strings.NewReader(options.Body)
 	}
-	requestContext := context.Background()
 	if options.TLSHandshakeDone != nil {
 		requestContext = context.WithValue(requestContext, tlsHandshakeDoneKey{}, options.TLSHandshakeDone)
 	}
