@@ -203,15 +203,14 @@ func TestScopedClientSnapshotsOptionsAndReclaimsRepeatedUse(t *testing.T) {
 	}))
 	baseline := runtime.NumGoroutine()
 	for i := 0; i < 32; i++ {
-		opts := Options{InsecureSkipVerify: true, MaxResponseBodySize: -1, Headers: map[string]string{"X-Value": "original"}, Cookies: []Cookie{{Name: "session", Value: "one"}}, BodyBytes: []byte("body")}
+		opts := Options{InsecureSkipVerify: true, MaxResponseBodySize: -1}
+		request := RequestOptions{Headers: map[string]string{"X-Value": "original"}, Cookies: []Cookie{{Name: "session", Value: "one"}}, BodyBytes: []byte("body")}
 		c, err := NewClient(opts)
 		if err != nil {
 			t.Fatal(err)
 		}
-		opts.Headers["X-Value"] = "changed"
-		opts.Cookies[0].Value = "other"
-		opts.BodyBytes[0] = 'x'
-		r, err := c.DoContext(context.Background(), s.URL, "POST")
+		opts.MaxResponseBodySize = 0
+		r, err := c.DoContext(context.Background(), s.URL, "POST", request)
 		c.Close()
 		if err != nil || r.Body != "original|session=one|body" {
 			t.Fatalf("request inherited external mutation: %+v %v", r, err)
@@ -329,7 +328,82 @@ func TestScopedClientDeadlineDoesNotDiscardHealthyConnection(t *testing.T) {
 }
 
 func TestScopedClientRejectsForcedConnectionClose(t *testing.T) {
-	if _, err := NewClient(Options{Headers: map[string]string{"connection": "keep-alive, Close"}}); err == nil {
-		t.Fatal("accepted request defaults that forbid persistent connections")
+	c, err := NewClient(Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Do("http://127.0.0.1:1", "GET", RequestOptions{Headers: map[string]string{"connection": "keep-alive, Close"}}); err == nil {
+		t.Fatal("accepted request that forbids persistent connections")
+	}
+}
+
+// Constructor request defaults would leak headers and bodies across requests.
+func TestScopedClientRejectsRequestDefaults(t *testing.T) {
+	for name, opts := range map[string]Options{
+		"headers":        {Headers: map[string]string{"X-Value": "default"}},
+		"user agent":     {UserAgent: "default"},
+		"cookies":        {Cookies: []Cookie{{Name: "session", Value: "default"}}},
+		"header order":   {HeaderOrder: []string{"user-agent"}},
+		"body":           {Body: "default"},
+		"binary body":    {BodyBytes: []byte("default")},
+		"provided order": {OrderAsProvided: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c, err := NewClient(opts)
+			if err == nil {
+				c.Close()
+				t.Fatal("accepted request parameters in NewClient")
+			}
+		})
+	}
+}
+
+// Shared request state would send another request's headers, cookies or body.
+func TestScopedClientRequestOptionsAreIsolated(t *testing.T) {
+	s, connections, _ := scopedTestServer(t, 8, stdhttp.HandlerFunc(func(w stdhttp.ResponseWriter, r *stdhttp.Request) {
+		body, _ := io.ReadAll(r.Body)
+		fmt.Fprintf(w, "%s|%s|%s|%s", r.UserAgent(), r.Header.Get("X-Value"), r.Header.Get("Cookie"), body)
+	}))
+	c, err := NewClient(Options{InsecureSkipVerify: true, MaxResponseBodySize: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			id := fmt.Sprint(i)
+			request := RequestOptions{
+				UserAgent:   "agent-" + id,
+				Headers:     map[string]string{"X-Value": id},
+				HeaderOrder: []string{"user-agent", "x-value", "cookie"},
+				Cookies:     []Cookie{{Name: "session", Value: id}},
+				Body:        id,
+			}
+			if i%2 == 0 {
+				request.Body = "unused"
+				request.BodyBytes = []byte(id)
+			}
+			if i%3 == 0 {
+				request.UserAgent = ""
+				request.Headers["uSeR-aGeNt"] = "agent-" + id
+			}
+			r, err := c.Do(s.URL, "POST", request)
+			want := "agent-" + id + "|" + id + "|session=" + id + "|" + id
+			if err != nil || r.Status != 200 || r.Body != want {
+				t.Errorf("request %d: %+v %v, want %q", i, r, err, want)
+			}
+		}(i)
+	}
+	wg.Wait()
+	r, err := c.Do(s.URL, "GET")
+	if err != nil || r.Body != "|||" {
+		t.Fatalf("request inherited previous options: %+v %v", r, err)
+	}
+	if connections.Load() != 1 {
+		t.Fatalf("request options changed connection: %d", connections.Load())
 	}
 }

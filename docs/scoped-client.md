@@ -8,21 +8,29 @@ cli, err := cycletls.NewClient(cycletls.Options{
     SignatureAlgorithms: "RAND",
     Timeout:             15,
     MaxResponseBodySize:  -1,
-    UserAgent:           "my-client",
 })
 if err != nil {
     return err
 }
 defer cli.Close()
 
-resp, err := cli.Do("https://example.com/api", "GET")
+resp, err := cli.Do("https://example.com/api", "POST", cycletls.RequestOptions{
+    UserAgent: "my-client",
+    Headers: map[string]string{
+        "Content-Type": "application/json",
+        "X-Request-ID": "request-1",
+    },
+    HeaderOrder: []string{"user-agent", "content-type", "x-request-id", "cookie"},
+    Cookies: []cycletls.Cookie{{Name: "session", Value: "one"}},
+    Body: `{"hello":"world"}`,
+})
 if err != nil {
     return err
 }
 fmt.Println(resp.Status, resp.Body)
 ```
 
-也可使用 `cli.DoContext(ctx, url, method)` 为单次请求设置取消或截止时间。
+也可使用 `cli.DoContext(ctx, url, method, requestOptions)` 为单次请求设置取消或截止时间。
 同一个实例支持多个 goroutine 并发调用。
 
 ## 连接复用
@@ -36,13 +44,20 @@ fmt.Println(resp.Status, resp.Body)
 - `EnableConnectionReuse`、`MaxTotalRequests`、`MaxIdleClients`、`Meta`
   不控制该接口；它始终复用，不按请求次数轮换。需要全局池及次数轮换时继续使用 `Init()`。
 - HTTP/2 保证要求服务端实际协商 HTTP/2；HTTP/1.1 回退可能建立多条并发连接。
-- 显式的 `Connection: close` 默认请求头会在构造时被拒绝。
+- 请求中显式的 `Connection: close` 会在发送前被拒绝。
 
 ## 配置与返回值
 
-构造参数是实例的固定默认配置，包括 Headers、Cookies、Body/BodyBytes、HeaderOrder、
-代理、IP、LocalIP、指纹、超时和响应体大小限制。map、slice 等会复制，后续修改传入参数
-不会改变实例。当前接口每次调用只接收 URL、方法和可选的 context。
+构造参数只配置代理、IP、LocalIP、指纹、协议、超时、重定向策略和响应体大小限制等实例设置。
+`Headers`、`UserAgent`、`Cookies`、`HeaderOrder`、`Body`、`BodyBytes` 和 `OrderAsProvided`
+不能在 `NewClient` 中设置；传入非空值会返回错误。`Init()` / `CycleTLS.Do` 接口不受影响。
+
+每次请求通过可选的 `RequestOptions` 设置 Headers、UserAgent、Cookies、HeaderOrder 和
+Body/BodyBytes。`BodyBytes` 非空时优先于 Body。UserAgent 也可通过 Headers 中的
+`User-Agent` 设置；同时设置时以 RequestOptions.UserAgent 为准。
+不需要这些参数时仍可调用 `cli.Do(url, method)` 或 `cli.DoContext(ctx, url, method)`。
+每次调用最多传一个 RequestOptions，请求之间不会继承这些值，也不会因这些值变化而新建连接。
+请求进行期间不要修改传入的 map、slice 等数据。
 
 返回值沿用 `CycleTLS.Do` 的 `Response`，包括指纹、IP、响应头和正文。普通网络错误仍
 沿用原有的 `Response.Status/Body` 表达方式；不要仅检查 Go `error`。调用方 context 取消
@@ -70,7 +85,7 @@ fmt.Println(resp.Status, resp.Body)
 - 两个独立实例与全局池之间的连接及关闭隔离。
 - 响应头、正文、流名额等待和 TLS 握手期间关闭；多个 goroutine 同时 Close。
 - 单次 deadline 不影响其他请求；连接失败后正常重建。
-- 参数快照、反复创建/关闭 32 次、连接与 goroutine 回收。
+- 实例参数快照、请求参数并发隔离及连接复用、构造参数校验、反复创建/关闭 32 次、连接与 goroutine 回收。
 
 ```powershell
 go test -race . -run '^TestScopedClient' -count=5 -timeout=90s
